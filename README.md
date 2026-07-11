@@ -112,6 +112,11 @@ A default build uses:
 - The native LLVM target only
 - `cmake --build ... --target install`
 
+On macOS, LLVM Manager also configures Clang with `-DCLANG_USE_XCSELECT=ON`.
+This enables the Darwin driver to discover the active Apple SDK and its libc++
+headers without requiring callers to add `-isysroot` or a manual libc++ include
+path to every compile command.
+
 The default install prefix identifies the requested source revision:
 
 - Release tag: `./install/llvmorg-22.1.8/`
@@ -151,7 +156,10 @@ python3 llvm_manager.py build 22.1.8 \
 
 After checking out the selected revision, the manager reads `LLVM_VERSION_MAJOR` from LLVM's monorepo-level `cmake/Modules/LLVMVersion.cmake`, with fallbacks for older or downstream layouts. It then creates major-version aliases for installed executables. For LLVM 22, examples include `clang-22`, `clang++-22`, `llvm-config-22`, and `ld.lld-22`. Unix uses relative symbolic links; Windows uses hard links when possible and copies as a fallback.
 
-The installation is verified by running `clang-<major> --version` and compiling a small C source file to an object file.
+The installation is verified by running `clang-<major> --version`, compiling a
+small C source file, and compiling a C++20 source file that includes
+`<concepts>`. The C++ check catches missing SDK or standard-library header search
+paths that a C-only verification would otherwise miss.
 
 ## Switching versions
 

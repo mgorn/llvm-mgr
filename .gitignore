@@ -9,3 +9,4 @@ activate.ps1
 activate.fish
 *.pyc
 /source
+TEST_RESULTS.md

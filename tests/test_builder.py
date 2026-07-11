@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from llvm_mgr.builder import _llvm_major
+from llvm_mgr.builder import _host_cmake_options, _llvm_major
 from llvm_mgr.util import LLVMManagerError
 
 
@@ -40,6 +40,15 @@ class BuilderVersionTests(unittest.TestCase):
             llvm.mkdir()
             with self.assertRaisesRegex(LLVMManagerError, "LLVMVersion\\.cmake"):
                 _llvm_major(llvm)
+
+
+class BuilderPlatformTests(unittest.TestCase):
+    def test_enables_xcselect_on_macos(self) -> None:
+        self.assertEqual(_host_cmake_options("darwin"), ("-DCLANG_USE_XCSELECT=ON",))
+
+    def test_does_not_enable_xcselect_on_other_platforms(self) -> None:
+        self.assertEqual(_host_cmake_options("linux"), ())
+        self.assertEqual(_host_cmake_options("win32"), ())
 
 
 if __name__ == "__main__":

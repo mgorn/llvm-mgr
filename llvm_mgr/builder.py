@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,6 +38,12 @@ class BuildOptions:
 
 def _cmake_list(values: tuple[str, ...]) -> str:
     return ";".join(value for value in values if value)
+
+
+def _host_cmake_options(platform: str) -> tuple[str, ...]:
+    if platform == "darwin":
+        return ("-DCLANG_USE_XCSELECT=ON",)
+    return ()
 
 
 def _validate_options(options: BuildOptions) -> None:
@@ -82,16 +89,34 @@ def _llvm_major(llvm_source: Path) -> int:
 def _verify_install(prefix: Path, major: int, env: dict[str, str]) -> None:
     suffix = ".exe" if os.name == "nt" else ""
     clang = prefix / "bin" / f"clang-{major}{suffix}"
+    clangxx = prefix / "bin" / f"clang++-{major}{suffix}"
     if not clang.is_file():
         raise LLVMManagerError(f"Installed compiler was not found: {clang}")
+    if not clangxx.is_file():
+        raise LLVMManagerError(f"Installed C++ compiler was not found: {clangxx}")
     run([clang, "--version"], env=env)
     with tempfile.TemporaryDirectory(prefix="llvm-manager-verify-") as temporary:
-        source = Path(temporary) / "verify.c"
-        output = Path(temporary) / ("verify.obj" if os.name == "nt" else "verify.o")
-        source.write_text("int llvm_manager_verify(void) { return 0; }\n", encoding="utf-8")
-        run([clang, "-c", source, "-o", output], env=env)
-        if not output.is_file():
-            raise LLVMManagerError("Clang verification command succeeded but produced no object file")
+        directory = Path(temporary)
+        object_suffix = ".obj" if os.name == "nt" else ".o"
+
+        c_source = directory / "verify.c"
+        c_output = directory / f"verify-c{object_suffix}"
+        c_source.write_text("int llvm_manager_verify(void) { return 0; }\n", encoding="utf-8")
+        run([clang, "-c", c_source, "-o", c_output], env=env)
+        if not c_output.is_file():
+            raise LLVMManagerError("Clang C verification succeeded but produced no object file")
+
+        cxx_source = directory / "verify.cxx"
+        cxx_output = directory / f"verify-cxx{object_suffix}"
+        cxx_source.write_text(
+            "#include <concepts>\n"
+            "static_assert(std::same_as<int, int>);\n"
+            "int main() { return 0; }\n",
+            encoding="utf-8",
+        )
+        run([clangxx, "-std=c++20", "-c", cxx_source, "-o", cxx_output], env=env)
+        if not cxx_output.is_file():
+            raise LLVMManagerError("Clang C++ verification succeeded but produced no object file")
 
 
 def build_and_install(paths: ManagerPaths, options: BuildOptions) -> Path:
@@ -134,6 +159,7 @@ def build_and_install(paths: ManagerPaths, options: BuildOptions) -> Path:
         "-DLLVM_INCLUDE_EXAMPLES=OFF",
         "-DLLVM_INCLUDE_BENCHMARKS=OFF",
     ]
+    configure.extend(_host_cmake_options(sys.platform))
     if options.runtimes:
         configure.append(f"-DLLVM_ENABLE_RUNTIMES={_cmake_list(options.runtimes)}")
     if options.targets and options.targets.lower() != "all":
