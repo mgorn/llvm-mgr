@@ -3,8 +3,12 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from llvm_mgr.builder import _host_cmake_options, _llvm_major
+from llvm_mgr.builder import BuildOptions, _configure_command, _host_cmake_options, _llvm_major
+from llvm_mgr.repository import RevisionKind, SourceRevision
+from llvm_mgr.standard_library import MANAGED_LIBCXX_STANDARD_LIBRARY
+from llvm_mgr.toolchains import HostToolchain
 from llvm_mgr.util import LLVMManagerError
 
 
@@ -49,6 +53,39 @@ class BuilderPlatformTests(unittest.TestCase):
     def test_does_not_enable_xcselect_on_other_platforms(self) -> None:
         self.assertEqual(_host_cmake_options("linux"), ())
         self.assertEqual(_host_cmake_options("win32"), ())
+
+
+class BuilderStandardLibraryTests(unittest.TestCase):
+    def test_managed_libcxx_is_added_to_the_runtimes_build(self) -> None:
+        host = HostToolchain(
+            "clang",
+            "Clang",
+            "clang",
+            Path("/host/clang"),
+            Path("/host/clang++"),
+        )
+        options = BuildOptions(
+            revision=SourceRevision(RevisionKind.TAG, "22.1.8"),
+            install_prefix=Path("/install"),
+            host_toolchain=host,
+            cxx_standard_library=MANAGED_LIBCXX_STANDARD_LIBRARY,
+        )
+        with patch("llvm_mgr.builder.sys.platform", "darwin"):
+            command = _configure_command(
+                "cmake",
+                "ninja",
+                Path("/source/llvm"),
+                Path("/build"),
+                Path("/install"),
+                options,
+            )
+
+        self.assertIn(
+            "-DLLVM_ENABLE_RUNTIMES=compiler-rt;libcxx;libcxxabi;libunwind",
+            command,
+        )
+        self.assertIn("-DLIBCXXABI_USE_LLVM_UNWINDER=ON", command)
+        self.assertIn("-DCLANG_USE_XCSELECT=ON", command)
 
 
 if __name__ == "__main__":

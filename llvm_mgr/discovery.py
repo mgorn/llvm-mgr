@@ -53,6 +53,41 @@ def _metadata(prefix: Path) -> dict[str, object]:
     return value if isinstance(value, dict) else {}
 
 
+def _metadata_standard_library(
+    metadata: dict[str, object],
+    install_version: LLVMVersion | None,
+) -> tuple[str | None, str | None]:
+    value = metadata.get("cxx_standard_library")
+    if isinstance(value, dict) and isinstance(value.get("kind"), str):
+        kind = value["kind"]
+        provider_version = value.get("provider_version")
+        if not isinstance(provider_version, str):
+            provider_prefix = value.get("provider_prefix")
+            if kind == "managed-libc++" and provider_prefix in (None, "", ".") and install_version:
+                provider_version = install_version.display
+            else:
+                provider_version = None
+        return kind, provider_version
+    if isinstance(value, str):
+        return value, install_version.display if value == "managed-libc++" and install_version else None
+    return None, None
+
+
+def _metadata_has_managed_libcxx(metadata: dict[str, object]) -> bool:
+    available = metadata.get("managed_cxx_standard_library")
+    if isinstance(available, dict) and available.get("kind") == "managed-libc++":
+        return True
+
+    selected = metadata.get("cxx_standard_library")
+    return (
+        isinstance(selected, dict)
+        and selected.get("kind") == "managed-libc++"
+        and selected.get("provider_prefix") in (None, "", ".")
+        and isinstance(selected.get("headers"), str)
+        and isinstance(selected.get("libraries"), str)
+    )
+
+
 def _metadata_tag(metadata: dict[str, object]) -> str | None:
     # Read the current source schema, retaining compatibility with installs made
     # by llvm-manager 1.5 and earlier.
@@ -102,13 +137,18 @@ def inspect_install(
     tag = _metadata_tag(metadata)
     tag_version = parse_llvm_tag(tag) if tag else None
     manager_owned = (resolved / ".llvm-manager.json").is_file() if managed is None else managed
+    version = tag_version or probed_version
+    standard_library, standard_library_version = _metadata_standard_library(metadata, version)
     return InstallInfo(
         prefix=resolved,
         clang=clang,
-        version=tag_version or probed_version,
+        version=version,
         managed=manager_owned,
         active=active_prefix == resolved,
         tag=tag,
+        cxx_standard_library=standard_library,
+        cxx_standard_library_version=standard_library_version,
+        managed_libcxx_available=_metadata_has_managed_libcxx(metadata),
     )
 
 

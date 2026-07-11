@@ -240,6 +240,8 @@ def switch_install(
             "active_prefix": str(selected_prefix),
             "version": install.version.display if install.version else None,
             "tag": install.tag,
+            "cxx_standard_library": install.cxx_standard_library,
+            "cxx_standard_library_version": install.cxx_standard_library_version,
         }
 
         if os.name == "nt":  # pragma: no cover - exercised on Windows

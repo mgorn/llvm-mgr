@@ -13,6 +13,15 @@ from pathlib import Path
 from .aliases import ensure_versioned_binaries
 from .config import ManagerPaths
 from .repository import DEFAULT_REPOSITORY_URL, LLVMRepository, SourceRevision
+from .standard_library import (
+    MANAGED_LIBCXX_STANDARD_LIBRARY,
+    SYSTEM_CXX_STANDARD_LIBRARY,
+    configure_standard_library,
+    managed_libcxx_capability,
+    standard_library_cmake_options,
+    standard_library_runtimes,
+    validate_standard_library,
+)
 from .toolchains import HostToolchain, toolchain_environment
 from .util import LLVMManagerError, file_lock, read_json, require_tools, run, write_json
 
@@ -31,12 +40,17 @@ class BuildOptions:
     targets: str = "Native"
     jobs: int = max(1, os.cpu_count() or 1)
     repository_url: str = DEFAULT_REPOSITORY_URL
+    cxx_standard_library: str = SYSTEM_CXX_STANDARD_LIBRARY
     verify: bool = True
     clean: bool = False
 
 
 def _cmake_list(values: tuple[str, ...]) -> str:
     return ";".join(value for value in values if value)
+
+
+def _effective_runtimes(options: BuildOptions) -> tuple[str, ...]:
+    return standard_library_runtimes(options.cxx_standard_library, options.runtimes)
 
 
 def _host_cmake_options(platform: str) -> tuple[str, ...]:
@@ -52,6 +66,7 @@ def _validate_options(options: BuildOptions) -> None:
         raise LLVMManagerError(f"Unsupported CMake build type: {options.build_type}")
     if "clang" not in options.projects:
         raise LLVMManagerError("The project list must include clang")
+    validate_standard_library(options.cxx_standard_library)
     if not options.host_toolchain.cc.is_file():
         raise LLVMManagerError(f"Selected C compiler was not found: {options.host_toolchain.cc}")
     if not options.host_toolchain.cxx.is_file():
@@ -86,7 +101,8 @@ def _configuration(options: BuildOptions, install_prefix: Path) -> dict[str, obj
         "install_prefix": str(install_prefix),
         "build_type": options.build_type,
         "projects": list(options.projects),
-        "runtimes": list(options.runtimes),
+        "runtimes": list(_effective_runtimes(options)),
+        "cxx_standard_library": options.cxx_standard_library,
         "targets": options.targets,
         "repository": options.repository_url,
         "host_cc": str(options.host_toolchain.cc),
@@ -188,8 +204,10 @@ def _configure_command(
         "-DLLVM_INCLUDE_BENCHMARKS=OFF",
     ]
     command.extend(_host_cmake_options(sys.platform))
-    if options.runtimes:
-        command.append(f"-DLLVM_ENABLE_RUNTIMES={_cmake_list(options.runtimes)}")
+    runtimes = _effective_runtimes(options)
+    if runtimes:
+        command.append(f"-DLLVM_ENABLE_RUNTIMES={_cmake_list(runtimes)}")
+    command.extend(standard_library_cmake_options(options.cxx_standard_library))
     if options.targets and options.targets.lower() != "all":
         command.append(f"-DLLVM_TARGETS_TO_BUILD={options.targets}")
     return command
@@ -239,8 +257,12 @@ def _verify_install(
                 run([output], env=env)
 
 
-def _installed_files(build_dir: Path, prefix: Path, aliases: list[Path]) -> list[str]:
-    paths = [*aliases, prefix / ".llvm-manager.json"]
+def _installed_files(
+    build_dir: Path,
+    prefix: Path,
+    manager_files: list[Path],
+) -> list[str]:
+    paths = [*manager_files, prefix / ".llvm-manager.json"]
     manifest = build_dir / "install_manifest.txt"
     if manifest.is_file():
         for line in manifest.read_text(encoding="utf-8").splitlines():
@@ -308,6 +330,13 @@ def build_and_install(paths: ManagerPaths, options: BuildOptions) -> Path:
         )
 
         created_aliases = ensure_versioned_binaries(install_prefix, major)
+        standard_library, standard_library_files = configure_standard_library(
+            install_prefix,
+            major,
+            build_env,
+            options.cxx_standard_library,
+        )
+        manager_files = [*created_aliases, *standard_library_files]
         if options.verify:
             _verify_install(
                 install_prefix,
@@ -317,18 +346,21 @@ def build_and_install(paths: ManagerPaths, options: BuildOptions) -> Path:
             )
 
         metadata = {
-            "schema_version": 2,
+            "schema_version": 4,
             "source": resolved_revision.to_json(),
             "major": major,
             "configuration_hash": config_hash,
             "build_type": options.build_type,
             "projects": list(options.projects),
-            "runtimes": list(options.runtimes),
+            "runtimes": list(_effective_runtimes(options)),
+            "cxx_standard_library": standard_library,
             "targets": options.targets,
             "repository": options.repository_url,
             "host_toolchain": options.host_toolchain.to_json(),
             "versioned_aliases": [str(path.relative_to(install_prefix)) for path in created_aliases],
         }
-        metadata["installed_files"] = _installed_files(build_dir, install_prefix, created_aliases)
+        if standard_library.get("kind") == MANAGED_LIBCXX_STANDARD_LIBRARY:
+            metadata["managed_cxx_standard_library"] = managed_libcxx_capability(standard_library)
+        metadata["installed_files"] = _installed_files(build_dir, install_prefix, manager_files)
         write_json(install_prefix / ".llvm-manager.json", metadata)
         return install_prefix

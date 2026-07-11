@@ -10,6 +10,12 @@ import tempfile
 from pathlib import Path
 
 PROJECT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT))
+
+from llvm_mgr.config import ManagerPaths
+from llvm_mgr.discovery import scan_installs
+from llvm_mgr.standard_library import switch_standard_library
+
 CLI = PROJECT / "llvm_manager.py"
 
 
@@ -119,6 +125,9 @@ import sys
 if '--version' in sys.argv:
     print('clang version 22.1.8 (llvm-manager container simulation)')
     raise SystemExit(0)
+if '--print-target-triple' in sys.argv or '-dumpmachine' in sys.argv:
+    print('x86_64-unknown-linux-gnu')
+    raise SystemExit(0)
 if '-o' in sys.argv:
     output = pathlib.Path(sys.argv[sys.argv.index('-o') + 1])
     output.write_text(chr(35) + '!/bin/sh' + chr(10) + 'exit 0' + chr(10), encoding='utf-8')
@@ -132,6 +141,13 @@ for name in ('clang++', 'clang-cpp', 'llvm-config', 'ld.lld'):
     if target.exists() or target.is_symlink():
         target.unlink()
     target.symlink_to('clang')
+
+configure_args = (build / 'configure-args.txt').read_text(encoding='utf-8')
+if 'libcxx' in configure_args:
+    (prefix / 'include' / 'c++' / 'v1').mkdir(parents=True, exist_ok=True)
+    library_dir = prefix / 'lib' / 'x86_64-unknown-linux-gnu'
+    library_dir.mkdir(parents=True, exist_ok=True)
+    (library_dir / 'libc++.so').write_text('', encoding='utf-8')
 """,
         encoding="utf-8",
     )
@@ -189,6 +205,8 @@ def main() -> int:
                 "22.1.8",
                 "--jobs",
                 "2",
+                "--stdlib",
+                "managed-libc++",
                 "--switch",
                 "--shell",
                 "/bin/bash",
@@ -207,11 +225,26 @@ def main() -> int:
         assert len(metadata["source"]["commit"]) == 40
         assert metadata["host_toolchain"]["family"] == "clang"
         assert metadata["host_toolchain"]["cc"] == str(host_compiler)
+        standard_library = metadata["cxx_standard_library"]
+        assert standard_library["kind"] == "managed-libc++"
+        assert metadata["managed_cxx_standard_library"]["kind"] == "managed-libc++"
+        assert standard_library["target"] == "x86_64-unknown-linux-gnu"
+        assert standard_library["headers"] == "include/c++/v1"
+        assert standard_library["libraries"] == "lib/x86_64-unknown-linux-gnu"
+        config = install / standard_library["config"]
+        assert config.is_file()
+        config_text = config.read_text(encoding="utf-8")
+        assert "-stdlib=libc++" in config_text
+        assert "-nostdinc++" in config_text
+        assert "-nostdlib++" not in config_text
+        assert "-Wl,-rpath," in config_text
         build_dirs = list((manager_root / "build").iterdir())
         assert len(build_dirs) == 1
         configure_args = (build_dirs[0] / "configure-args.txt").read_text(encoding="utf-8")
         assert f"-DCMAKE_C_COMPILER={host_compiler}" in configure_args
         assert f"-DCMAKE_CXX_COMPILER={fake_bin / 'clang++'}" in configure_args
+        assert "-DLLVM_ENABLE_RUNTIMES=compiler-rt;libcxx;libcxxabi;libunwind" in configure_args
+        assert "-DLIBCXXABI_USE_LLVM_UNWINDER=ON" in configure_args
         assert (manager_root / "current").resolve() == install.resolve()
         assert "# >>> llvm-manager >>>" in (home / ".bashrc").read_text(encoding="utf-8")
 
@@ -229,7 +262,31 @@ def main() -> int:
             env=env,
         )
         installs = json.loads(listing.stdout)
-        assert any(item["version"] == "22.1.8" and item["active"] for item in installs)
+        assert any(
+            item["version"] == "22.1.8"
+            and item["active"]
+            and item["cxx_standard_library"] == "managed-libc++"
+            and item["cxx_standard_library_version"] == "22.1.8"
+            and item["managed_libcxx_available"]
+            for item in installs
+        )
+
+        paths = ManagerPaths.create(manager_root, home)
+        managed_installs = scan_installs(paths, include_external=False)
+        active = next(item for item in managed_installs if item.active)
+        switch_standard_library(paths, active, None, env=env)
+        switched_metadata = json.loads((install / ".llvm-manager.json").read_text(encoding="utf-8"))
+        assert switched_metadata["cxx_standard_library"] == {"kind": "system"}
+        assert switched_metadata["managed_cxx_standard_library"]["kind"] == "managed-libc++"
+        assert not config.exists()
+
+        managed_installs = scan_installs(paths, include_external=False)
+        active = next(item for item in managed_installs if item.active)
+        provider = next(item for item in managed_installs if item.managed_libcxx_available)
+        switch_standard_library(paths, active, provider, env=env)
+        switched_metadata = json.loads((install / ".llvm-manager.json").read_text(encoding="utf-8"))
+        assert switched_metadata["cxx_standard_library"]["provider_version"] == "22.1.8"
+        assert (install / switched_metadata["cxx_standard_library"]["config"]).is_file()
 
         branch_build = run(
             [
@@ -261,7 +318,11 @@ def main() -> int:
         assert branch_metadata["source"]["value"] == "test-branch"
         assert len(branch_metadata["source"]["commit"]) == 40
 
-        print("Container smoke test passed: dependency check -> host-toolchain discovery/selection -> tag and branch checkout -> configure -> install -> aliases -> verify -> switch -> discover")
+        print(
+            "Container smoke test passed: dependency check -> host-toolchain "
+            "discovery/selection -> tag and branch checkout -> configure -> "
+            "managed libc++ pairing and reselection -> install -> aliases -> verify -> switch -> discover"
+        )
     return 0
 
 

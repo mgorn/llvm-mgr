@@ -87,7 +87,7 @@ A default build enables:
 - The native LLVM target
 - `cmake --build ... --target install`
 
-On macOS, Clang is configured with `-DCLANG_USE_XCSELECT=ON` so the Darwin driver can discover the active Apple SDK and libc++ headers.
+On macOS, Clang is configured with `-DCLANG_USE_XCSELECT=ON` so the Darwin driver can discover the active Apple SDK. By default, C++ compilation continues to use the libc++ supplied by that SDK.
 
 Examples:
 
@@ -97,10 +97,36 @@ llvm-manager build --branch release/22.x
 llvm-manager build 22.1.8 --targets all --jobs 12
 llvm-manager build --branch main --targets 'X86;AArch64;WebAssembly' --switch
 llvm-manager build 22.1.8 --projects clang,clang-tools-extra,lld --runtimes compiler-rt
+llvm-manager build 22.1.8 --stdlib managed-libc++ --switch
 llvm-manager build 22.1.8 --install-dir /custom/llvm-22 --switch
 ```
 
-The resolved Git commit, build configuration, selected host toolchain, and installed-file manifest are recorded in `.llvm-manager.json`. Build directories are automatically reset when their configuration changes. `--clean` explicitly clears the build directory and a manager-owned install before rebuilding; it refuses to recursively delete an unrecognized custom prefix.
+### Managed C++ standard library
+
+Each LLVM installation can use either the platform C++ standard library or a libc++ built from a managed LLVM source revision:
+
+```sh
+# Default: use the platform / Xcode SDK libc++.
+llvm-manager build 22.1.8 --stdlib system
+
+# Build libc++, libc++abi, and libunwind with the new Clang and pair them with it.
+llvm-manager build 22.1.8 --stdlib managed-libc++
+```
+
+`--cxx-stdlib` is accepted as an alias for `--stdlib`. On macOS, the interactive build flow offers the same choice.
+
+When the currently selected LLVM installation is manager-owned, the main menu also includes **Switch C++ standard library**. It lists the platform/Xcode SDK library and every libc++ version available from manager-owned LLVM installations. Selecting one rewrites only the active compiler's target-specific configuration; it does not rebuild, move, or modify the provider installation. Switching back to the platform library removes the pairing configuration but keeps any locally built libc++ available for later reuse.
+
+A managed libc++ is installed inside the LLVM prefix rather than replacing anything in Xcode or the operating system. LLVM Manager adds `libcxx`, `libcxxabi`, and `libunwind` to `LLVM_ENABLE_RUNTIMES`, so CMake builds them with the just-built Clang as part of the toolchain build. It then creates a relocatable, target-specific Clang configuration in the selected compiler's `bin` directory. Normal use of that installation's `clang++` therefore:
+
+- ignores the SDK's C++ headers while continuing to use the SDK for C headers, frameworks, and platform libraries;
+- uses the paired `include/c++/v1` headers and libc++ libraries;
+- embeds the paired library directory as a runtime search path; and
+- avoids applying the host libc++ automatically when an explicit different target is selected.
+
+Pass Clang's `--no-default-config` option to bypass the pairing for an individual invocation. Managed libc++ pairing is currently available on POSIX hosts and is intentionally rejected on Windows.
+
+The resolved Git commit, build configuration, selected host toolchain, available managed libc++ runtime, active C++ standard-library pairing, and installed-file manifest are recorded in `.llvm-manager.json`. `llvm-manager list` labels paired installations with the selected libc++ version. Build directories are automatically reset when their configuration changes. `--clean` explicitly clears the build directory and a manager-owned install before rebuilding; it refuses to recursively delete an unrecognized custom prefix.
 
 CMake is given the exact discovered compiler and Ninja paths, avoiding a second inconsistent PATH lookup.
 
@@ -111,7 +137,7 @@ After installation, LLVM Manager:
 1. Creates and validates major-version aliases for known LLVM tools, such as `clang-22`, `clang++-22`, `llvm-config-22`, and `ld.lld-22`.
 2. Runs `clang-<major> --version`.
 3. Compiles and links a C executable.
-4. Compiles and links a C++20 executable that includes `<concepts>`.
+4. Compiles and links a C++20 executable that includes `<concepts>`, using the paired libc++ configuration when selected.
 5. Runs both executables for native builds.
 
 Use `--no-verify` only when the target cannot run on the host or verification must be handled separately.
@@ -159,4 +185,4 @@ python3 tests/container_smoke_test.py
 python3 run_tests.py
 ```
 
-The unit suite covers dependency planning, compiler discovery, install inspection, version selection, alias correction, build invalidation, shell rendering, transactional rollback, JSON/profile recovery, and CLI regressions. The smoke test exercises dependency discovery, tag and branch checkout, configure, install, alias creation, link/run verification, switching, and rediscovery. GitHub Actions runs the unit suite on Linux, macOS, and Windows with Python 3.10 and 3.13.
+The unit suite covers dependency planning, compiler discovery, install inspection, version selection, alias correction, managed libc++ configuration and version switching, conditional menu behavior, build invalidation, shell rendering, transactional rollback, JSON/profile recovery, and CLI regressions. The smoke test exercises dependency discovery, tag and branch checkout, configure, managed libc++ installation, pairing and reselection, alias creation, link/run verification, switching, and rediscovery. GitHub Actions runs the unit suite on Linux, macOS, and Windows with Python 3.10 and 3.13.

@@ -64,13 +64,15 @@ class DiscoveryQualityTests(unittest.TestCase):
             bin_dir.mkdir()
             executable(bin_dir / "clang-22")
             (prefix / ".llvm-manager.json").write_text(
-                '{"source":{"kind":"tag","value":"llvmorg-22.1.8","commit":"abc"}}',
+                '{"source":{"kind":"tag","value":"llvmorg-22.1.8","commit":"abc"},'
+                '"cxx_standard_library":{"kind":"managed-libc++"}}',
                 encoding="utf-8",
             )
             install = inspect_install(prefix)
             self.assertIsNotNone(install)
             self.assertEqual(install.tag, "llvmorg-22.1.8")
             self.assertTrue(install.managed)
+            self.assertEqual(install.cxx_standard_library, "managed-libc++")
 
 
 class SelectorQualityTests(unittest.TestCase):

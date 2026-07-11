@@ -26,6 +26,12 @@ from .repository import (
     fetch_remote_branches,
 )
 from .switcher import activation_script, switch_install
+from .standard_library import (
+    CXX_STANDARD_LIBRARY_CHOICES,
+    MANAGED_LIBCXX_STANDARD_LIBRARY,
+    SYSTEM_CXX_STANDARD_LIBRARY,
+    switch_standard_library,
+)
 from .toolchains import HostToolchain, prompt_for_host_toolchain, select_host_toolchain
 from .util import LLVMManagerError, set_command_echo
 from .versioning import LLVMVersion, latest_per_major, normalize_tag
@@ -205,12 +211,28 @@ def _default_install(paths: ManagerPaths, revision: SourceRevision) -> Path:
     return paths.install_root / revision.directory_name
 
 
+def _select_cxx_standard_library() -> str:
+    print("C++ standard library:")
+    print("  1) Use the platform / Xcode SDK standard library")
+    print("  2) Build and pair libc++ from the selected LLVM revision")
+    while True:
+        selection = _prompt("Select a C++ standard library [1]: ", default="1")
+        if selection in {"1", SYSTEM_CXX_STANDARD_LIBRARY}:
+            return SYSTEM_CXX_STANDARD_LIBRARY
+        if selection in {"2", MANAGED_LIBCXX_STANDARD_LIBRARY, "libc++"}:
+            return MANAGED_LIBCXX_STANDARD_LIBRARY
+        print("Choose 1 or 2.")
+
+
 def _interactive_build(paths: ManagerPaths, repository_url: str) -> Path:
     revision = _select_revision(repository_url)
     host_toolchain = _choose_host_toolchain(None, prompt_install=True)
     default = _default_install(paths, revision)
     response = _prompt(f"Install directory [{default}]: ")
     install_prefix = Path(response).expanduser() if response else default
+    cxx_standard_library = (
+        _select_cxx_standard_library() if sys.platform == "darwin" else SYSTEM_CXX_STANDARD_LIBRARY
+    )
     targets = _prompt("LLVM targets to build [Native; enter 'all' for every backend]: ", default="Native")
     jobs = int(_prompt(f"Parallel build jobs [{max(1, os.cpu_count() or 1)}]: ", default=str(max(1, os.cpu_count() or 1))))
     return build_and_install(
@@ -222,26 +244,84 @@ def _interactive_build(paths: ManagerPaths, repository_url: str) -> Path:
             targets=targets,
             jobs=jobs,
             repository_url=repository_url,
+            cxx_standard_library=cxx_standard_library,
         ),
     )
+
+
+def _active_managed_install(installs: list[InstallInfo]) -> InstallInfo | None:
+    if os.name == "nt":
+        return None
+    return next((install for install in installs if install.active and install.managed), None)
+
+
+def _system_standard_library_description() -> str:
+    return "Xcode SDK standard library" if sys.platform == "darwin" else "platform standard library"
+
+
+def _standard_library_description(install: InstallInfo) -> str:
+    if install.cxx_standard_library != MANAGED_LIBCXX_STANDARD_LIBRARY:
+        return _system_standard_library_description()
+    version = install.cxx_standard_library_version
+    return f"managed libc++ {version}" if version else "managed libc++"
+
+
+def _interactive_switch_standard_library(
+    paths: ManagerPaths,
+    compiler: InstallInfo,
+    installs: list[InstallInfo],
+) -> None:
+    providers = [
+        install
+        for install in installs
+        if install.managed and install.managed_libcxx_available
+    ]
+    print(f"Current compiler: {compiler.label}")
+    print(f"Current C++ standard library: {_standard_library_description(compiler)}")
+    print("Available C++ standard libraries:")
+    print(f"  1) {_system_standard_library_description().capitalize()}")
+    for index, provider in enumerate(providers, start=2):
+        version = provider.version.display if provider.version else "unknown"
+        location = " (same LLVM install)" if provider.prefix == compiler.prefix else ""
+        print(f"  {index}) Managed libc++ {version}{location}")
+
+    while True:
+        selection = _prompt("Select a C++ standard library: ")
+        if selection == "1":
+            switch_standard_library(paths, compiler, None)
+            system_library = _system_standard_library_description()
+            print(f"Selected the {system_library} for LLVM {compiler.version.display}.")
+            return
+        if selection.isdigit() and 2 <= int(selection) <= len(providers) + 1:
+            provider = providers[int(selection) - 2]
+            switch_standard_library(paths, compiler, provider)
+            version = provider.version.display if provider.version else "unknown"
+            print(f"Selected managed libc++ {version} for LLVM {compiler.version.display}.")
+            return
+        print(f"Choose a number from 1 to {len(providers) + 1}.")
 
 
 def _menu(paths: ManagerPaths, repository_url: str) -> int:
     if not sys.stdin.isatty():
         raise LLVMManagerError("The interactive menu requires a terminal; choose a subcommand instead")
     while True:
+        installs = scan_installs(paths)
+        active_managed = _active_managed_install(installs)
         print("\nLLVM Manager")
         print("1) Display installed versions")
         print("2) Switch installed version")
         print("3) Build & install an LLVM source revision")
-        print("4) Exit")
+        if active_managed is not None:
+            print("4) Switch C++ standard library")
+            print("5) Exit")
+        else:
+            print("4) Exit")
+
         choice = _prompt("Select an option: ")
         if choice == "1":
-            installs = scan_installs(paths)
             print(f"Found {len(installs)} LLVM/Clang installation(s).")
             print_installs(installs)
         elif choice == "2":
-            installs = scan_installs(paths)
             print_installs(installs)
             if installs:
                 selected = _find_install(installs, _prompt("Version, #list-number, or install path: "))
@@ -249,10 +329,13 @@ def _menu(paths: ManagerPaths, repository_url: str) -> int:
                 _print_switch_result(paths, selected, profile)
         elif choice == "3":
             print(f"Installed LLVM at {_interactive_build(paths, repository_url)}")
-        elif choice == "4":
+        elif choice == "4" and active_managed is not None:
+            _interactive_switch_standard_library(paths, active_managed, installs)
+        elif choice == ("5" if active_managed is not None else "4"):
             return 0
         else:
-            print("Choose 1, 2, 3, or 4.")
+            valid = "1, 2, 3, 4, or 5" if active_managed is not None else "1, 2, 3, or 4"
+            print(f"Choose {valid}.")
 
 
 def build_parser(default_root: Path | None = None) -> argparse.ArgumentParser:
@@ -302,6 +385,14 @@ def build_parser(default_root: Path | None = None) -> argparse.ArgumentParser:
     build.add_argument("--build-type", default="Release", choices=["Debug", "Release", "RelWithDebInfo", "MinSizeRel"])
     build.add_argument("--projects", default="clang,clang-tools-extra,lld", help="Comma-separated LLVM projects")
     build.add_argument("--runtimes", default="compiler-rt", help="Comma-separated LLVM runtimes; empty disables")
+    build.add_argument(
+        "--stdlib",
+        "--cxx-stdlib",
+        dest="cxx_standard_library",
+        default=SYSTEM_CXX_STANDARD_LIBRARY,
+        choices=CXX_STANDARD_LIBRARY_CHOICES,
+        help="C++ standard library paired with this install (default: system)",
+    )
     build.add_argument("--targets", default="Native", help="LLVM targets, semicolon-separated, or 'all'")
     build.add_argument("--jobs", type=int, default=max(1, os.cpu_count() or 1))
     build.add_argument("--clean", action="store_true", help="Clean the build directory and manager-owned install before building")
@@ -414,6 +505,7 @@ def _handle_build(arguments: argparse.Namespace, paths: ManagerPaths) -> int:
             targets=arguments.targets,
             jobs=arguments.jobs,
             repository_url=arguments.repo_url,
+            cxx_standard_library=arguments.cxx_standard_library,
             verify=not arguments.no_verify,
             clean=arguments.clean,
         ),

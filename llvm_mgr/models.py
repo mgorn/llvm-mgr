@@ -15,13 +15,23 @@ class InstallInfo:
     managed: bool
     active: bool = False
     tag: str | None = None
+    cxx_standard_library: str | None = None
+    cxx_standard_library_version: str | None = None
+    managed_libcxx_available: bool = False
 
     @property
     def label(self) -> str:
         version = self.version.display if self.version else "unknown"
         source = "managed" if self.managed else "external"
-        active = ", active" if self.active else ""
-        return f"LLVM {version} ({source}{active}) - {self.prefix}"
+        details = [source]
+        if self.active:
+            details.append("active")
+        if self.cxx_standard_library == "managed-libc++":
+            pairing = "paired libc++"
+            if self.cxx_standard_library_version:
+                pairing += f" {self.cxx_standard_library_version}"
+            details.append(pairing)
+        return f"LLVM {version} ({', '.join(details)}) - {self.prefix}"
 
     def to_json(self) -> dict[str, Any]:
         data = asdict(self)
