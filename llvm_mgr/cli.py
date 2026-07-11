@@ -45,8 +45,8 @@ def _csv_tuple(value: str) -> tuple[str, ...]:
     return tuple(item.strip() for item in value.replace(";", ",").split(",") if item.strip())
 
 
-def _paths(arguments: argparse.Namespace) -> ManagerPaths:
-    root = Path(arguments.root) if arguments.root else None
+def _paths(arguments: argparse.Namespace, default_root: Path | None = None) -> ManagerPaths:
+    root = Path(arguments.root) if arguments.root else default_manager_root(default_root)
     home = Path(arguments.home) if arguments.home else None
     return ManagerPaths.create(root, home)
 
@@ -255,13 +255,13 @@ def _menu(paths: ManagerPaths, repository_url: str) -> int:
             print("Choose 1, 2, 3, or 4.")
 
 
-def build_parser() -> argparse.ArgumentParser:
-    default_root = default_manager_root()
+def build_parser(default_root: Path | None = None) -> argparse.ArgumentParser:
+    resolved_default_root = default_manager_root(default_root)
     parser = argparse.ArgumentParser(
         prog="llvm-manager",
         description="Download, build, install, discover, and switch versioned LLVM/Clang toolchains.",
     )
-    parser.add_argument("--root", type=Path, help=f"Manager data root (default: {default_root})")
+    parser.add_argument("--root", type=Path, help=f"Manager workspace root (default: {resolved_default_root})")
     parser.add_argument("--home", help=argparse.SUPPRESS)
     parser.add_argument("--repo-url", default=DEFAULT_REPOSITORY_URL, help="LLVM Git repository URL")
     parser.add_argument("--quiet", action="store_true", help="Do not echo external commands")
@@ -439,11 +439,11 @@ _HANDLERS: dict[str, Callable[[argparse.Namespace, ManagerPaths], int]] = {
 }
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    parser = build_parser()
+def main(argv: Sequence[str] | None = None, *, default_root: Path | None = None) -> int:
+    parser = build_parser(default_root)
     arguments = parser.parse_args(argv)
     set_command_echo(not arguments.quiet)
-    paths = _paths(arguments)
+    paths = _paths(arguments, default_root)
     command = arguments.command or "menu"
     try:
         if command == "menu":

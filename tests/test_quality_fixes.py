@@ -254,9 +254,19 @@ class BuildQualityTests(unittest.TestCase):
 
 
 class ConfigQualityTests(unittest.TestCase):
-    def test_environment_override_controls_default_data_root(self) -> None:
+    def test_workspace_argument_controls_default_root(self) -> None:
+        workspace = Path("/tmp/llvm-manager-workspace")
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(default_manager_root(workspace), workspace)
+
+    def test_current_directory_is_the_fallback_workspace(self) -> None:
+        workspace = Path("/tmp/llvm-manager-cwd")
+        with patch.dict(os.environ, {}, clear=True), patch("llvm_mgr.config.Path.cwd", return_value=workspace):
+            self.assertEqual(default_manager_root(), workspace)
+
+    def test_environment_override_controls_default_workspace_root(self) -> None:
         with patch.dict(os.environ, {"LLVM_MANAGER_ROOT": "~/custom-llvm-root"}):
-            self.assertEqual(default_manager_root(Path("/tmp/home")), Path("~/custom-llvm-root").expanduser())
+            self.assertEqual(default_manager_root(Path("/tmp/workspace")), Path("~/custom-llvm-root").expanduser())
 
 
 if __name__ == "__main__":

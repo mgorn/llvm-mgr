@@ -10,3 +10,4 @@ activate.fish
 *.pyc
 /source
 TEST_RESULTS.md
+*.lock

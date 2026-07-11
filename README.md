@@ -2,7 +2,7 @@
 
 A dependency-free Python 3.10+ tool for discovering, building, installing, and switching between LLVM/Clang toolchains from release tags, branches, or exact commits.
 
-## Installation and data location
+## Installation and workspace location
 
 Run directly from the checkout:
 
@@ -17,13 +17,14 @@ python3 -m pip install .
 llvm-manager --help
 ```
 
-Manager data is stored in a writable per-user data directory by default:
+When run directly through `llvm_manager.py`, LLVM Manager keeps its workspace beside that script. The checkout therefore remains self-contained:
 
-- Linux: `${XDG_DATA_HOME:-~/.local/share}/llvm-manager`
-- macOS: `~/Library/Application Support/llvm-manager`
-- Windows: `%LOCALAPPDATA%\llvm-manager`
+- `source/llvm-project` contains the LLVM Git clone.
+- `build/` contains generated build trees.
+- `install/` contains versioned installed toolchains.
+- State, activation scripts, and the `current` link are also stored in the workspace root.
 
-Override it with the global `--root` option or the `LLVM_MANAGER_ROOT` environment variable. Read-only commands such as `list` and `scan` do not create the data directory.
+When invoked through an installed `llvm-manager` console command, the current working directory is the default workspace. Override either behavior with the global `--root` option or the `LLVM_MANAGER_ROOT` environment variable. Read-only commands such as `list` and `scan` do not create the workspace.
 
 ## Build requirements
 

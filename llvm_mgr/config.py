@@ -1,24 +1,16 @@
 from __future__ import annotations
 
 import os
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 
-def default_manager_root(home: Path | None = None) -> Path:
+def default_manager_root(workspace: Path | None = None) -> Path:
     override = os.environ.get("LLVM_MANAGER_ROOT")
     if override:
         return Path(override).expanduser()
 
-    user_home = (home or Path.home()).expanduser()
-    if os.name == "nt":
-        base = os.environ.get("LOCALAPPDATA")
-        return Path(base) / "llvm-manager" if base else user_home / "AppData" / "Local" / "llvm-manager"
-    if sys.platform == "darwin":
-        return user_home / "Library" / "Application Support" / "llvm-manager"
-    xdg_data_home = os.environ.get("XDG_DATA_HOME")
-    return Path(xdg_data_home).expanduser() / "llvm-manager" if xdg_data_home else user_home / ".local" / "share" / "llvm-manager"
+    return (workspace or Path.cwd()).expanduser()
 
 
 @dataclass(frozen=True)
@@ -29,7 +21,7 @@ class ManagerPaths:
     @classmethod
     def create(cls, root: Path | None = None, home: Path | None = None) -> "ManagerPaths":
         resolved_home = (home or Path.home()).expanduser().resolve()
-        resolved_root = (root or default_manager_root(resolved_home)).expanduser().resolve()
+        resolved_root = (root or default_manager_root()).expanduser().resolve()
         return cls(root=resolved_root, home=resolved_home)
 
     @property
