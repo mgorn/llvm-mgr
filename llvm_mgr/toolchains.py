@@ -16,6 +16,9 @@ from .util import LLVMManagerError
 
 _VERSION_RE = re.compile(r"(?<!\d)(\d+(?:\.\d+){0,3})(?!\d)")
 _SAFE_ID_RE = re.compile(r"[^a-z0-9]+")
+_COMPILER_EXECUTABLE_RE = re.compile(
+    r"(?:cc|c\+\+|cl|clang-cl|clang(?:\+\+)?(?:-\d+(?:\.\d+)*)?|gcc(?:-\d+(?:\.\d+)*)?|g\+\+(?:-\d+(?:\.\d+)*)?)"
+)
 
 
 @dataclass(frozen=True)
@@ -160,6 +163,13 @@ def _compiler_description(path: Path, env: Mapping[str, str] | None = None) -> t
     return family, version_match.group(1) if version_match else None, name
 
 
+def _is_compiler_executable_name(name: str) -> bool:
+    normalized = name.lower()
+    if normalized.endswith(".exe"):
+        normalized = normalized[:-4]
+    return _COMPILER_EXECUTABLE_RE.fullmatch(normalized) is not None
+
+
 def _iter_path_executables(search_path: str) -> Iterable[Path]:
     seen: set[Path] = set()
     for raw_directory in search_path.split(os.pathsep):
@@ -171,10 +181,20 @@ def _iter_path_executables(search_path: str) -> Iterable[Path]:
         except OSError:
             continue
         for entry in entries:
-            absolute = entry.absolute()
-            if absolute in seen or not entry.is_file():
+            # PATH directories can contain protected or broken entries unrelated to
+            # compilers. Filter by name before performing any operation that follows
+            # the entry or reads its metadata.
+            if not _is_compiler_executable_name(entry.name):
                 continue
-            if os.name != "nt" and not os.access(entry, os.X_OK):
+            absolute = entry.absolute()
+            if absolute in seen:
+                continue
+            try:
+                if not entry.is_file():
+                    continue
+                if os.name != "nt" and not os.access(entry, os.X_OK):
+                    continue
+            except OSError:
                 continue
             seen.add(absolute)
             yield absolute

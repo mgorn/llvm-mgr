@@ -4,6 +4,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from llvm_mgr.toolchains import discover_host_toolchains, select_host_toolchain
 from llvm_mgr.util import LLVMManagerError
@@ -64,6 +65,27 @@ class ToolchainDiscoveryTests(unittest.TestCase):
 
             with self.assertRaises(LLVMManagerError):
                 select_host_toolchain(toolchains, "gcc")
+
+    def test_ignores_unrelated_path_entry_that_cannot_be_inspected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            binary_dir = Path(temporary)
+            clang = self._compiler(binary_dir, "clang", "clang version 18.1.8")
+            (binary_dir / "clang++").symlink_to(clang.name)
+            protected = binary_dir / "weakpass_edit"
+            protected.write_text("not a compiler\n", encoding="utf-8")
+
+            original_is_file = Path.is_file
+
+            def guarded_is_file(candidate: Path) -> bool:
+                if candidate.name == protected.name:
+                    raise PermissionError(13, "Permission denied", str(candidate))
+                return original_is_file(candidate)
+
+            with mock.patch.object(Path, "is_file", guarded_is_file):
+                toolchains = discover_host_toolchains(str(binary_dir))
+
+            self.assertEqual(len(toolchains), 1)
+            self.assertEqual(toolchains[0].family, "clang")
 
     def test_excludes_compiler_that_cannot_link_a_program(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

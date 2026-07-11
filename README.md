@@ -1,6 +1,6 @@
 # LLVM Manager
 
-A dependency-free Python tool for discovering, building, installing, and switching between versioned LLVM/Clang toolchains.
+A dependency-free Python tool for discovering, building, installing, and switching between LLVM/Clang toolchains built from release tags, branches, or exact commits.
 
 ## Requirements
 
@@ -60,7 +60,7 @@ LLVM Manager
 1) Check for existing installs
 2) Display the installed versions
 3) Switch installed version
-4) Build & install any other version
+4) Build & install an LLVM source revision
 5) Exit
 ```
 
@@ -87,6 +87,8 @@ python3 llvm_manager.py list
 python3 llvm_manager.py tags
 python3 llvm_manager.py switch 22
 python3 llvm_manager.py build 22.1.8
+python3 llvm_manager.py build --branch main
+python3 llvm_manager.py build --commit 0123456789abcdef
 ```
 
 Global options such as `--root` and `--repo-url` go before the subcommand:
@@ -99,7 +101,7 @@ The implementation lives in the `llvm_mgr/` Python package; there is no separate
 
 ## Build behavior
 
-Before fetching release tags, cloning source, or configuring CMake, the build command runs the same dependency check as `find-tools`. When requirements are missing in an interactive terminal, it shows the exact installation command, warns about sudo/administrator elevation, and asks whether to run it. It then rechecks the environment and will not start source work while Git, CMake, Ninja, or a usable C/C++ compiler toolchain is still missing.
+Before fetching tags or branches, cloning source, or configuring CMake, the build command runs the same dependency check as `find-tools`. When requirements are missing in an interactive terminal, it shows the exact installation command, warns about sudo/administrator elevation, and asks whether to run it. It then rechecks the environment and will not start source work while Git, CMake, Ninja, or a usable C/C++ compiler toolchain is still missing.
 
 A default build uses:
 
@@ -110,7 +112,13 @@ A default build uses:
 - The native LLVM target only
 - `cmake --build ... --target install`
 
-The default install prefix is `./install/<tag>/`. The interactive flow asks before using it.
+The default install prefix identifies the requested source revision:
+
+- Release tag: `./install/llvmorg-22.1.8/`
+- Branch: `./install/branch-main/` or `./install/branch-release-22.x/`
+- Commit: `./install/commit-0123456789ab/`
+
+The interactive flow first asks whether to build a release tag, remote branch, or exact commit, and then asks before using the default prefix. Branch names are selected from the remote branch list. Commit IDs must contain 7 to 40 hexadecimal characters.
 
 Examples:
 
@@ -118,11 +126,20 @@ Examples:
 # Build the default native toolchain.
 python3 llvm_manager.py build 22.1.8
 
+# Build the current tip of the main branch.
+python3 llvm_manager.py build --branch main
+
+# Build a release branch.
+python3 llvm_manager.py build --branch release/22.x
+
+# Build an exact commit.
+python3 llvm_manager.py build --commit 0123456789abcdef
+
 # Build all LLVM backends with 12 parallel jobs.
 python3 llvm_manager.py build 22.1.8 --targets all --jobs 12
 
 # Build selected backends and switch to the result.
-python3 llvm_manager.py build 22.1.8 \
+python3 llvm_manager.py build --branch main \
   --targets 'X86;AArch64;WebAssembly' \
   --switch
 
@@ -132,7 +149,7 @@ python3 llvm_manager.py build 22.1.8 \
   --runtimes compiler-rt
 ```
 
-After installation, the manager creates major-version aliases for installed executables. For LLVM 22, examples include `clang-22`, `clang++-22`, `llvm-config-22`, and `ld.lld-22`. Unix uses relative symbolic links; Windows uses hard links when possible and copies as a fallback.
+After checking out the selected revision, the manager reads `LLVM_VERSION_MAJOR` from LLVM's monorepo-level `cmake/Modules/LLVMVersion.cmake`, with fallbacks for older or downstream layouts. It then creates major-version aliases for installed executables. For LLVM 22, examples include `clang-22`, `clang++-22`, `llvm-config-22`, and `ld.lld-22`. Unix uses relative symbolic links; Windows uses hard links when possible and copies as a fallback.
 
 The installation is verified by running `clang-<major> --version` and compiling a small C source file to an object file.
 
@@ -158,11 +175,13 @@ On Windows, switching updates the current user's persistent `Path`, `LLVM_HOME`,
 
 ## Source checkout safety
 
-The manager uses one checkout at `source/llvm-project`. Before changing tags, it checks for modified or untracked files and refuses to overwrite them. Commit, stash, or remove local changes before retrying.
+The manager uses one checkout at `source/llvm-project`. Before changing tags, branches, or commits, it checks for modified or untracked files and refuses to overwrite them. Commit, stash, or remove local changes before retrying.
+
+Tag and branch selections are resolved to a full commit before checkout. Builds use detached HEAD mode so selecting a branch never modifies or creates a local branch. The installation metadata records the requested source kind/value and the exact resolved commit hash, making moving branch builds traceable.
 
 ## Compatibility note
 
-The build logic targets LLVM's modern monorepo CMake layout. Current and reasonably recent release tags use this layout. Very old historical tags may require version-specific CMake options or source-tree arrangements and can fail with a clear error rather than being modified destructively.
+The build logic targets LLVM's modern monorepo CMake layout. Current and reasonably recent release tags and branches use this layout. Very old historical tags may require version-specific CMake options or source-tree arrangements and can fail with a clear error rather than being modified destructively.
 
 ## Tests
 
@@ -171,4 +190,4 @@ python3 -m unittest discover -v
 python3 tests/container_smoke_test.py
 ```
 
-The smoke test creates a temporary local Git repository and a fake CMake installer. It exercises dependency reporting, compiler discovery and validation, tag fetching, cloning, tag checkout, configuration, installation, numbered aliases, compiler verification, version switching, shell-profile editing, and install rediscovery without attempting a multi-hour LLVM compilation.
+The smoke test creates a temporary local Git repository and a fake CMake installer. It exercises dependency reporting, compiler discovery and validation, tag fetching, cloning, revision checkout, configuration, installation, numbered aliases, compiler verification, version switching, shell-profile editing, and install rediscovery without attempting a multi-hour LLVM compilation.

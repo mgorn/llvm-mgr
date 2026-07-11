@@ -1,1 +1,11 @@
 .DS_Store
+.llvm-manager-state.json
+.llvm-manager-installs.json
+/build
+/install
+current
+activate.sh
+activate.ps1
+activate.fish
+*.pyc
+/source

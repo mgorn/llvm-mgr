@@ -17,7 +17,13 @@ from .dependencies import (
 )
 from .discovery import print_installs, scan_installs
 from .models import InstallInfo
-from .repository import DEFAULT_REPOSITORY_URL, fetch_release_tags
+from .repository import (
+    DEFAULT_REPOSITORY_URL,
+    RevisionKind,
+    SourceRevision,
+    fetch_release_tags,
+    fetch_remote_branches,
+)
 from .switcher import switch_install
 from .toolchains import (
     HostToolchain,
@@ -139,15 +145,43 @@ def _choose_host_toolchain(
     return prompt_for_host_toolchain(toolchains, display=False)
 
 
-def _default_install(paths: ManagerPaths, tag: str) -> Path:
-    return paths.install_root / tag
+def _select_branch(branches: list[str]) -> str:
+    print("Available remote branches:")
+    for index, branch in enumerate(branches, start=1):
+        print(f"  {index:>2}) {branch}")
+    while True:
+        selection = input("LLVM branch: ").strip()
+        if selection.isdigit() and 1 <= int(selection) <= len(branches):
+            return branches[int(selection) - 1]
+        if selection in branches:
+            return selection
+        print("That branch was not in the fetched remote branch list. Try again.")
+
+
+def _select_revision(repository_url: str) -> SourceRevision:
+    while True:
+        print("Source revision to build:")
+        print("  1) Release tag")
+        print("  2) Branch")
+        print("  3) Commit")
+        selection = input("Select a source type [1]: ").strip() or "1"
+        if selection == "1":
+            return SourceRevision(RevisionKind.TAG, _select_tag(fetch_release_tags(repository_url)))
+        if selection == "2":
+            return SourceRevision(RevisionKind.BRANCH, _select_branch(fetch_remote_branches(repository_url)))
+        if selection == "3":
+            return SourceRevision(RevisionKind.COMMIT, input("Commit ID: ").strip())
+        print("Choose 1, 2, or 3.")
+
+
+def _default_install(paths: ManagerPaths, revision: SourceRevision) -> Path:
+    return paths.install_root / revision.directory_name
 
 
 def _interactive_build(paths: ManagerPaths, repository_url: str) -> Path:
     host_toolchain = _choose_host_toolchain(None, prompt_install=True)
-    versions = fetch_release_tags(repository_url)
-    tag = _select_tag(versions)
-    default = _default_install(paths, tag)
+    revision = _select_revision(repository_url)
+    default = _default_install(paths, revision)
     response = input(f"Install directory [{default}]: ").strip()
     install_prefix = Path(response).expanduser() if response else default
     target_response = input("LLVM targets to build [Native; enter 'all' for every backend]: ").strip()
@@ -157,7 +191,7 @@ def _interactive_build(paths: ManagerPaths, repository_url: str) -> Path:
     return build_and_install(
         paths,
         BuildOptions(
-            tag=tag,
+            revision=revision,
             install_prefix=install_prefix,
             host_toolchain=host_toolchain,
             targets=targets,
@@ -173,7 +207,7 @@ def _menu(paths: ManagerPaths, repository_url: str) -> int:
         print("1) Check for existing installs")
         print("2) Display the installed versions")
         print("3) Switch installed version")
-        print("4) Build & install any other version")
+        print("4) Build & install an LLVM source revision")
         print("5) Exit")
         choice = input("Select an option: ").strip()
 
@@ -243,8 +277,11 @@ def build_parser() -> argparse.ArgumentParser:
     switch.add_argument("--shell", help="Shell executable/name used to select the profile")
     switch.add_argument("--profile", type=Path, help="Explicit shell profile to update")
 
-    build = subcommands.add_parser("build", help="Fetch, build, and install an LLVM release")
-    build.add_argument("tag", nargs="?", help="LLVM tag or version, for example llvmorg-22.1.8 or 22.1.8")
+    build = subcommands.add_parser("build", help="Fetch, build, and install LLVM from a tag, branch, or commit")
+    build.add_argument("tag", nargs="?", help="LLVM release tag or version, for example llvmorg-22.1.8 or 22.1.8")
+    revision = build.add_mutually_exclusive_group()
+    revision.add_argument("--branch", help="Build the current commit of a remote branch, for example main or release/22.x")
+    revision.add_argument("--commit", help="Build an exact 7- to 40-character hexadecimal commit ID")
     build.add_argument("--install-dir", type=Path, help="Versioned installation prefix")
     build.add_argument(
         "--toolchain",
@@ -345,15 +382,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                 install_missing=arguments.install_missing,
                 prompt_install=not arguments.no_install_prompt and sys.stdin.isatty(),
             )
-            tag = normalize_tag(arguments.tag) if arguments.tag else None
-            if tag is None:
-                versions = fetch_release_tags(arguments.repo_url)
-                tag = _select_tag(versions)
-            install_prefix = arguments.install_dir or _default_install(paths, tag)
+            if arguments.tag and (arguments.branch or arguments.commit):
+                raise LLVMManagerError("The positional release tag cannot be combined with --branch or --commit")
+            if arguments.branch:
+                source_revision = SourceRevision(RevisionKind.BRANCH, arguments.branch)
+            elif arguments.commit:
+                source_revision = SourceRevision(RevisionKind.COMMIT, arguments.commit)
+            elif arguments.tag:
+                source_revision = SourceRevision(RevisionKind.TAG, normalize_tag(arguments.tag))
+            else:
+                source_revision = _select_revision(arguments.repo_url)
+            install_prefix = arguments.install_dir or _default_install(paths, source_revision)
             prefix = build_and_install(
                 paths,
                 BuildOptions(
-                    tag=tag,
+                    revision=source_revision,
                     install_prefix=install_prefix,
                     host_toolchain=host_toolchain,
                     build_type=arguments.build_type,

@@ -48,10 +48,24 @@ def make_origin(path: Path) -> None:
     git(path, "config", "user.name", "Container Test")
     llvm = path / "llvm"
     llvm.mkdir()
-    (llvm / "CMakeLists.txt").write_text("cmake_minimum_required(VERSION 3.20)\nproject(fake_llvm)\n", encoding="utf-8")
+    (llvm / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.20)\n"
+        "include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/Modules/LLVMVersion.cmake)\n"
+        "project(fake_llvm)\n",
+        encoding="utf-8",
+    )
+    version_module = path / "cmake" / "Modules" / "LLVMVersion.cmake"
+    version_module.parent.mkdir(parents=True)
+    version_module.write_text(
+        "if(NOT DEFINED LLVM_VERSION_MAJOR)\n"
+        "  set(LLVM_VERSION_MAJOR 22)\n"
+        "endif()\n",
+        encoding="utf-8",
+    )
     git(path, "add", ".")
     git(path, "commit", "-m", "fake LLVM source")
     git(path, "tag", "llvmorg-22.1.8")
+    git(path, "branch", "test-branch")
 
 
 def make_fake_host_compiler(path: Path) -> Path:
@@ -186,6 +200,9 @@ def main() -> int:
         assert (install / "bin" / "clang-22").exists()
         assert (install / "bin" / "clang++-22").exists()
         metadata = json.loads((install / ".llvm-manager.json").read_text(encoding="utf-8"))
+        assert metadata["source"]["kind"] == "tag"
+        assert metadata["source"]["value"] == "llvmorg-22.1.8"
+        assert len(metadata["source"]["commit"]) == 40
         assert metadata["host_toolchain"]["family"] == "clang"
         assert metadata["host_toolchain"]["cc"] == str(host_compiler)
         build_dirs = list((manager_root / "build").iterdir())
@@ -212,7 +229,37 @@ def main() -> int:
         installs = json.loads(listing.stdout)
         assert any(item["version"] == "22.1.8" and item["active"] for item in installs)
 
-        print("Container smoke test passed: dependency check -> host-toolchain discovery/selection -> fake Git tag -> checkout -> configure -> install -> aliases -> verify -> switch -> discover")
+        branch_build = run(
+            [
+                sys.executable,
+                str(CLI),
+                "--root",
+                str(manager_root),
+                "--home",
+                str(home),
+                "--repo-url",
+                str(origin),
+                "build",
+                "--branch",
+                "test-branch",
+                "--toolchain",
+                "clang-18-1-8",
+                "--jobs",
+                "2",
+            ],
+            env=env,
+        )
+        print(branch_build.stdout)
+        branch_install = manager_root / "install" / "branch-test-branch"
+        assert (branch_install / "bin" / "clang-22").exists()
+        branch_metadata = json.loads(
+            (branch_install / ".llvm-manager.json").read_text(encoding="utf-8")
+        )
+        assert branch_metadata["source"]["kind"] == "branch"
+        assert branch_metadata["source"]["value"] == "test-branch"
+        assert len(branch_metadata["source"]["commit"]) == 40
+
+        print("Container smoke test passed: dependency check -> host-toolchain discovery/selection -> tag and branch checkout -> configure -> install -> aliases -> verify -> switch -> discover")
     return 0
 
 
