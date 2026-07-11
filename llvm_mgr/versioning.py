@@ -3,12 +3,14 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from functools import total_ordering
+from typing import Iterable
 
 _TAG_RE = re.compile(
     r"^llvmorg-(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)"
-    r"(?:(?:-|)(?P<pre>rc\d+|git))?$",
+    r"(?:-(?P<pre>rc\d+|git))?$",
     re.IGNORECASE,
 )
+_BARE_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(?:-(?:rc\d+|git))?$", re.IGNORECASE)
 _VERSION_RE = re.compile(r"(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)")
 
 
@@ -77,17 +79,21 @@ def parse_version_text(text: str) -> LLVMVersion | None:
 
 def normalize_tag(value: str) -> str:
     value = value.strip()
-    if value.startswith("llvmorg-"):
-        return value
-    if re.fullmatch(r"\d+\.\d+\.\d+(?:-rc\d+)?", value):
+    if value.lower().startswith("llvmorg-"):
+        return "llvmorg-" + value[len("llvmorg-") :]
+    if _BARE_VERSION_RE.fullmatch(value):
         return f"llvmorg-{value}"
     return value
 
 
-def latest_per_major(versions: list[LLVMVersion]) -> list[LLVMVersion]:
+def latest_per_major(
+    versions: Iterable[LLVMVersion],
+    *,
+    include_prerelease: bool = False,
+) -> list[LLVMVersion]:
     latest: dict[int, LLVMVersion] = {}
     for version in versions:
-        if not version.stable:
+        if not include_prerelease and not version.stable:
             continue
         current = latest.get(version.major)
         if current is None or version > current:

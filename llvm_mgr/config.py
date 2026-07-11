@@ -1,7 +1,24 @@
 from __future__ import annotations
 
+import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+
+def default_manager_root(home: Path | None = None) -> Path:
+    override = os.environ.get("LLVM_MANAGER_ROOT")
+    if override:
+        return Path(override).expanduser()
+
+    user_home = (home or Path.home()).expanduser()
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA")
+        return Path(base) / "llvm-manager" if base else user_home / "AppData" / "Local" / "llvm-manager"
+    if sys.platform == "darwin":
+        return user_home / "Library" / "Application Support" / "llvm-manager"
+    xdg_data_home = os.environ.get("XDG_DATA_HOME")
+    return Path(xdg_data_home).expanduser() / "llvm-manager" if xdg_data_home else user_home / ".local" / "share" / "llvm-manager"
 
 
 @dataclass(frozen=True)
@@ -10,8 +27,10 @@ class ManagerPaths:
     home: Path
 
     @classmethod
-    def create(cls, root: Path, home: Path | None = None) -> "ManagerPaths":
-        return cls(root=root.expanduser().resolve(), home=(home or Path.home()).expanduser().resolve())
+    def create(cls, root: Path | None = None, home: Path | None = None) -> "ManagerPaths":
+        resolved_home = (home or Path.home()).expanduser().resolve()
+        resolved_root = (root or default_manager_root(resolved_home)).expanduser().resolve()
+        return cls(root=resolved_root, home=resolved_home)
 
     @property
     def install_root(self) -> Path:
@@ -38,8 +57,8 @@ class ManagerPaths:
         return self.root / ".llvm-manager-state.json"
 
     @property
-    def scan_cache(self) -> Path:
-        return self.root / ".llvm-manager-installs.json"
+    def lock_file(self) -> Path:
+        return self.root / ".llvm-manager.lock"
 
     @property
     def activation_sh(self) -> Path:
@@ -53,8 +72,15 @@ class ManagerPaths:
     def activation_ps1(self) -> Path:
         return self.root / "activate.ps1"
 
-    def ensure(self) -> None:
+    def ensure_root(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
+
+    def ensure_build_layout(self) -> None:
+        self.ensure_root()
         self.install_root.mkdir(parents=True, exist_ok=True)
         self.source_root.mkdir(parents=True, exist_ok=True)
         self.build_root.mkdir(parents=True, exist_ok=True)
+
+    # Compatibility for callers that used the original broad initializer.
+    def ensure(self) -> None:
+        self.ensure_build_layout()

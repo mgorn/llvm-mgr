@@ -80,7 +80,7 @@ class DependencyCheckTests(unittest.TestCase):
                 report.missing_names,
                 ("Git", "CMake", "Ninja", "usable C/C++ compiler toolchain"),
             )
-            self.assertIn("Suggested command", report.install_hint)
+            self.assertNotIn("Suggested command", report.install_hint)
             with self.assertRaises(LLVMManagerError):
                 require_build_dependencies(report)
 

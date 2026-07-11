@@ -1,18 +1,15 @@
 from __future__ import annotations
 
 import os
-import re
-import shutil
-import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 
-from .toolchains import HostToolchain, discover_host_toolchains, print_host_toolchains
-from .util import LLVMManagerError, command_text, run
+from .toolchains import HostToolchain, discover_host_toolchains
+from .util import LLVMManagerError, command_text, extract_numeric_version, probe_text, run, shutil_which
 
-_VERSION_RE = re.compile(r"(?<!\d)(\d+(?:\.\d+){0,3})(?!\d)")
+_DEPENDENCY_ORDER = ("git", "cmake", "ninja", "compiler")
 
 
 @dataclass(frozen=True)
@@ -23,7 +20,6 @@ class ProgramDependency:
     executable: str
     path: Path | None
     version: str | None = None
-    required: bool = True
 
     @property
     def found(self) -> bool:
@@ -42,6 +38,7 @@ class DependencyInstallPlan:
     commands: tuple[tuple[str, ...], ...]
     requires_elevation: bool
     note: str = ""
+    available: bool = True
 
     @property
     def display(self) -> str:
@@ -53,6 +50,7 @@ class DependencyInstallPlan:
             "commands": [list(command) for command in self.commands],
             "display": self.display,
             "requires_elevation": self.requires_elevation,
+            "available": self.available,
             "note": self.note or None,
         }
 
@@ -66,7 +64,7 @@ class DependencyReport:
 
     @property
     def missing_programs(self) -> tuple[ProgramDependency, ...]:
-        return tuple(program for program in self.programs if program.required and not program.found)
+        return tuple(program for program in self.programs if not program.found)
 
     @property
     def compiler_available(self) -> bool:
@@ -94,23 +92,60 @@ class DependencyReport:
         }
 
 
-def _probe_version(path: Path, arguments: tuple[str, ...] = ("--version",)) -> str | None:
-    try:
-        completed = subprocess.run(
-            [str(path), *arguments],
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=10,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
+@dataclass(frozen=True)
+class _LinuxManager:
+    names: tuple[str, ...]
+    distributions: frozenset[str]
+    packages: Mapping[str, tuple[str, ...]]
+    install_arguments: tuple[str, ...]
+    update_arguments: tuple[str, ...] = ()
 
-    if completed.returncode != 0:
-        return None
-    output = "\n".join(part for part in (completed.stdout, completed.stderr) if part)
-    match = _VERSION_RE.search(output)
-    return match.group(1) if match else None
+    def commands(self, executable: str, selected: tuple[str, ...], elevation: tuple[str, ...]) -> tuple[tuple[str, ...], ...]:
+        commands: list[tuple[str, ...]] = []
+        if self.update_arguments:
+            commands.append((*elevation, executable, *self.update_arguments))
+        commands.append((*elevation, executable, *self.install_arguments, *selected))
+        return tuple(commands)
+
+
+_LINUX_MANAGERS = (
+    _LinuxManager(
+        ("apt-get",),
+        frozenset({"debian", "ubuntu", "linuxmint", "pop"}),
+        {"git": ("git",), "cmake": ("cmake",), "ninja": ("ninja-build",), "compiler": ("build-essential",)},
+        ("install", "-y"),
+        ("update",),
+    ),
+    _LinuxManager(
+        ("dnf",),
+        frozenset({"fedora", "rhel", "centos", "rocky", "almalinux"}),
+        {"git": ("git",), "cmake": ("cmake",), "ninja": ("ninja-build",), "compiler": ("gcc", "gcc-c++")},
+        ("install", "-y"),
+    ),
+    _LinuxManager(
+        ("pacman",),
+        frozenset({"arch", "manjaro", "garuda"}),
+        {"git": ("git",), "cmake": ("cmake",), "ninja": ("ninja",), "compiler": ("base-devel",)},
+        ("-S", "--needed", "--noconfirm"),
+    ),
+    _LinuxManager(
+        ("zypper",),
+        frozenset({"opensuse", "opensuse-leap", "opensuse-tumbleweed", "sles"}),
+        {"git": ("git",), "cmake": ("cmake",), "ninja": ("ninja",), "compiler": ("gcc", "gcc-c++")},
+        ("--non-interactive", "install"),
+    ),
+    _LinuxManager(
+        ("apk",),
+        frozenset({"alpine"}),
+        {"git": ("git",), "cmake": ("cmake",), "ninja": ("ninja",), "compiler": ("build-base",)},
+        ("add",),
+    ),
+)
+
+
+def _probe_version(path: Path, arguments: tuple[str, ...] = ("--version",)) -> str | None:
+    output = probe_text([path, *arguments])
+    return extract_numeric_version(output)
 
 
 def _find_program(
@@ -120,7 +155,7 @@ def _find_program(
     executable: str,
     search_path: str,
 ) -> ProgramDependency:
-    found = shutil.which(executable, path=search_path)
+    found = shutil_which(executable, search_path)
     path = Path(found).absolute() if found else None
     return ProgramDependency(
         identifier=identifier,
@@ -145,132 +180,64 @@ def _linux_distribution() -> str:
         return ""
 
 
-def _needs_elevation_prefix() -> tuple[str, ...]:
+def _elevation(search_path: str) -> tuple[tuple[str, ...], bool, bool]:
     if os.name == "nt":
-        return ()
+        return (), False, True
     try:
         if os.geteuid() == 0:
-            return ()
+            return (), False, True
     except AttributeError:
-        pass
-    return ("sudo",) if shutil.which("sudo") else ()
+        return (), False, True
+    sudo = shutil_which("sudo", search_path)
+    return ((sudo or "sudo",), True, sudo is not None)
 
 
-def _linux_install_plan(missing: set[str]) -> DependencyInstallPlan | None:
-    distribution = _linux_distribution()
-    elevated = _needs_elevation_prefix()
-
-    if distribution in {"debian", "ubuntu", "linuxmint", "pop"}:
-        packages = {
-            "git": "git",
-            "cmake": "cmake",
-            "ninja": "ninja-build",
-            "compiler": "build-essential",
-        }
-        selected = tuple(packages[key] for key in ("git", "cmake", "ninja", "compiler") if key in missing)
-        return DependencyInstallPlan(
-            manager="apt",
-            commands=(
-                (*elevated, "apt-get", "update"),
-                (*elevated, "apt-get", "install", "-y", *selected),
-            ),
-            requires_elevation=True,
-        )
-
-    if distribution in {"fedora", "rhel", "centos", "rocky", "almalinux"}:
-        packages = {
-            "git": ("git",),
-            "cmake": ("cmake",),
-            "ninja": ("ninja-build",),
-            "compiler": ("gcc", "gcc-c++"),
-        }
-        selected = tuple(package for key in ("git", "cmake", "ninja", "compiler") if key in missing for package in packages[key])
-        return DependencyInstallPlan(
-            manager="dnf",
-            commands=((*elevated, "dnf", "install", "-y", *selected),),
-            requires_elevation=True,
-        )
-
-    if distribution in {"arch", "manjaro", "garuda"}:
-        packages = {
-            "git": "git",
-            "cmake": "cmake",
-            "ninja": "ninja",
-            "compiler": "base-devel",
-        }
-        selected = tuple(packages[key] for key in ("git", "cmake", "ninja", "compiler") if key in missing)
-        return DependencyInstallPlan(
-            manager="pacman",
-            commands=((*elevated, "pacman", "-S", "--needed", "--noconfirm", *selected),),
-            requires_elevation=True,
-        )
-
-    if distribution in {"opensuse", "opensuse-leap", "opensuse-tumbleweed", "sles"}:
-        packages = {
-            "git": ("git",),
-            "cmake": ("cmake",),
-            "ninja": ("ninja",),
-            "compiler": ("gcc", "gcc-c++"),
-        }
-        selected = tuple(package for key in ("git", "cmake", "ninja", "compiler") if key in missing for package in packages[key])
-        return DependencyInstallPlan(
-            manager="zypper",
-            commands=((*elevated, "zypper", "--non-interactive", "install", *selected),),
-            requires_elevation=True,
-        )
-
-    if distribution == "alpine":
-        packages = {
-            "git": "git",
-            "cmake": "cmake",
-            "ninja": "ninja",
-            "compiler": "build-base",
-        }
-        selected = tuple(packages[key] for key in ("git", "cmake", "ninja", "compiler") if key in missing)
-        return DependencyInstallPlan(
-            manager="apk",
-            commands=((*elevated, "apk", "add", *selected),),
-            requires_elevation=True,
-        )
-
-    candidates = (
-        ("apt-get", {"git": "git", "cmake": "cmake", "ninja": "ninja-build", "compiler": "build-essential"}),
-        ("dnf", {"git": "git", "cmake": "cmake", "ninja": "ninja-build", "compiler": "gcc-c++"}),
-        ("pacman", {"git": "git", "cmake": "cmake", "ninja": "ninja", "compiler": "base-devel"}),
-        ("zypper", {"git": "git", "cmake": "cmake", "ninja": "ninja", "compiler": "gcc-c++"}),
-        ("apk", {"git": "git", "cmake": "cmake", "ninja": "ninja", "compiler": "build-base"}),
+def _select_packages(manager: _LinuxManager, missing: set[str]) -> tuple[str, ...]:
+    return tuple(
+        package
+        for key in _DEPENDENCY_ORDER
+        if key in missing
+        for package in manager.packages[key]
     )
-    for manager, packages in candidates:
-        if not shutil.which(manager):
-            continue
-        selected = tuple(packages[key] for key in ("git", "cmake", "ninja", "compiler") if key in missing)
-        if manager == "apt-get":
-            commands = (
-                (*elevated, manager, "update"),
-                (*elevated, manager, "install", "-y", *selected),
-            )
-        elif manager == "dnf":
-            commands = ((*elevated, manager, "install", "-y", *selected),)
-        elif manager == "pacman":
-            commands = ((*elevated, manager, "-S", "--needed", "--noconfirm", *selected),)
-        elif manager == "zypper":
-            commands = ((*elevated, manager, "--non-interactive", "install", *selected),)
-        else:
-            commands = ((*elevated, manager, "add", *selected),)
-        return DependencyInstallPlan(manager, commands, requires_elevation=True)
-    return None
 
 
-def _macos_install_plan(missing: set[str]) -> DependencyInstallPlan | None:
-    brew = shutil.which("brew")
+def _linux_install_plan(missing: set[str], search_path: str) -> DependencyInstallPlan | None:
+    distribution = _linux_distribution()
+    preferred = [manager for manager in _LINUX_MANAGERS if distribution in manager.distributions]
+    managers = [*preferred, *(manager for manager in _LINUX_MANAGERS if manager not in preferred)]
+
+    selected_manager: _LinuxManager | None = None
+    executable: str | None = None
+    for manager in managers:
+        for name in manager.names:
+            found = shutil_which(name, search_path)
+            if found:
+                selected_manager = manager
+                executable = found
+                break
+        if selected_manager:
+            break
+    if selected_manager is None or executable is None:
+        return None
+
+    elevation, required, available = _elevation(search_path)
+    note = ""
+    if required and not available:
+        note = "Automatic installation requires sudo, but sudo was not found on the selected PATH."
+    return DependencyInstallPlan(
+        manager=selected_manager.names[0],
+        commands=selected_manager.commands(executable, _select_packages(selected_manager, missing), elevation),
+        requires_elevation=required,
+        available=available,
+        note=note,
+    )
+
+
+def _macos_install_plan(missing: set[str], search_path: str) -> DependencyInstallPlan | None:
+    brew = shutil_which("brew", search_path)
     if brew:
-        packages = {
-            "git": "git",
-            "cmake": "cmake",
-            "ninja": "ninja",
-            "compiler": "llvm",
-        }
-        selected = tuple(packages[key] for key in ("git", "cmake", "ninja", "compiler") if key in missing)
+        packages = {"git": "git", "cmake": "cmake", "ninja": "ninja", "compiler": "llvm"}
+        selected = tuple(packages[key] for key in _DEPENDENCY_ORDER if key in missing)
         return DependencyInstallPlan(
             manager="homebrew",
             commands=((brew, "install", *selected),),
@@ -278,11 +245,12 @@ def _macos_install_plan(missing: set[str]) -> DependencyInstallPlan | None:
             note="Homebrew LLVM may need its bin directory added to PATH after installation.",
         )
 
-    if "compiler" in missing:
+    xcode_select = shutil_which("xcode-select", search_path)
+    if "compiler" in missing and xcode_select:
         return DependencyInstallPlan(
             manager="xcode-select",
-            commands=(("xcode-select", "--install"),),
-            requires_elevation=True,
+            commands=((xcode_select, "--install"),),
+            requires_elevation=False,
             note=(
                 "The Apple developer-tools installer opens interactively. After it finishes, install any still-missing "
                 "Git/CMake/Ninja tools and rerun the dependency check."
@@ -291,29 +259,24 @@ def _macos_install_plan(missing: set[str]) -> DependencyInstallPlan | None:
     return None
 
 
-def _windows_install_plan(missing: set[str]) -> DependencyInstallPlan | None:
-    winget = shutil.which("winget")
+def _windows_install_plan(missing: set[str], search_path: str) -> DependencyInstallPlan | None:
+    winget = shutil_which("winget", search_path)
     if winget:
         commands: list[tuple[str, ...]] = []
-        package_ids = {
-            "git": "Git.Git",
-            "cmake": "Kitware.CMake",
-            "ninja": "Ninja-build.Ninja",
-        }
+        package_ids = {"git": "Git.Git", "cmake": "Kitware.CMake", "ninja": "Ninja-build.Ninja"}
         for key in ("git", "cmake", "ninja"):
-            if key not in missing:
-                continue
-            commands.append(
-                (
-                    winget,
-                    "install",
-                    "--id",
-                    package_ids[key],
-                    "--exact",
-                    "--accept-source-agreements",
-                    "--accept-package-agreements",
+            if key in missing:
+                commands.append(
+                    (
+                        winget,
+                        "install",
+                        "--id",
+                        package_ids[key],
+                        "--exact",
+                        "--accept-source-agreements",
+                        "--accept-package-agreements",
+                    )
                 )
-            )
         if "compiler" in missing:
             commands.append(
                 (
@@ -335,7 +298,7 @@ def _windows_install_plan(missing: set[str]) -> DependencyInstallPlan | None:
             note="Windows may display a UAC prompt. Open a new terminal afterward so PATH changes are visible.",
         )
 
-    choco = shutil.which("choco")
+    choco = shutil_which("choco", search_path)
     if choco:
         packages = {
             "git": ("git",),
@@ -343,7 +306,7 @@ def _windows_install_plan(missing: set[str]) -> DependencyInstallPlan | None:
             "ninja": ("ninja",),
             "compiler": ("visualstudio2022buildtools", "visualstudio2022-workload-vctools"),
         }
-        selected = tuple(package for key in ("git", "cmake", "ninja", "compiler") if key in missing for package in packages[key])
+        selected = tuple(package for key in _DEPENDENCY_ORDER if key in missing for package in packages[key])
         return DependencyInstallPlan(
             manager="chocolatey",
             commands=((choco, "install", "-y", *selected),),
@@ -353,14 +316,14 @@ def _windows_install_plan(missing: set[str]) -> DependencyInstallPlan | None:
     return None
 
 
-def _installation_plan(missing: set[str]) -> DependencyInstallPlan | None:
+def _installation_plan(missing: set[str], search_path: str) -> DependencyInstallPlan | None:
     if not missing:
         return None
     if os.name == "nt":
-        return _windows_install_plan(missing)
+        return _windows_install_plan(missing, search_path)
     if sys.platform == "darwin":
-        return _macos_install_plan(missing)
-    return _linux_install_plan(missing)
+        return _macos_install_plan(missing, search_path)
+    return _linux_install_plan(missing, search_path)
 
 
 def _installation_hint(missing_names: tuple[str, ...], plan: DependencyInstallPlan | None) -> str:
@@ -399,7 +362,7 @@ def check_build_dependencies(search_path: str | None = None) -> DependencyReport
         [program.name for program in programs if not program.found]
         + ([] if toolchains else ["usable C/C++ compiler toolchain"])
     )
-    install_plan = _installation_plan(missing_keys)
+    install_plan = _installation_plan(missing_keys, path_value)
     return DependencyReport(
         programs=programs,
         toolchains=toolchains,
@@ -408,43 +371,13 @@ def check_build_dependencies(search_path: str | None = None) -> DependencyReport
     )
 
 
-def print_dependency_report(report: DependencyReport, *, show_toolchains: bool = True) -> None:
-    print("LLVM build dependency check:")
-    for program in report.programs:
-        if program.found:
-            version = f" {program.version}" if program.version else ""
-            print(f"  [OK]      {program.name}{version}: {program.path}")
-        else:
-            print(f"  [MISSING] {program.name}: needed to {program.purpose}")
-
-    if report.compiler_available:
-        count = len(report.toolchains)
-        suffix = "" if count == 1 else "s"
-        print(f"  [OK]      Host compiler: {count} usable C/C++ toolchain{suffix} found")
-    else:
-        print("  [MISSING] Host compiler: GCC, Clang/AppleClang, ClangCL, or MSVC is required")
-
-    if report.ready:
-        print("All required LLVM build dependencies are available.")
-    else:
-        print("\nRequired dependencies are missing.")
-        print(report.install_hint)
-
-    if show_toolchains and report.toolchains:
-        print()
-        print_host_toolchains(list(report.toolchains))
-
-
 def run_dependency_install(plan: DependencyInstallPlan) -> None:
     if not plan.commands:
         raise LLVMManagerError("No dependency installation command is available for this platform")
+    if not plan.available:
+        raise LLVMManagerError(plan.note or "The dependency installer cannot be run automatically")
     for command in plan.commands:
-        try:
-            run(command)
-        except FileNotFoundError as error:
-            raise LLVMManagerError(
-                f"Could not run the suggested installer because {command[0]!r} was not found"
-            ) from error
+        run(command)
 
 
 def offer_dependency_install(
@@ -471,11 +404,16 @@ def offer_dependency_install(
     if plan.note:
         print(plan.note)
 
+    if not plan.available:
+        return report
     if not assume_yes:
         if not prompt:
             return report
         reader = input_fn or input
-        response = reader("Run the dependency installation command now? [y/N]: ").strip().lower()
+        try:
+            response = reader("Run the dependency installation command now? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt) as error:
+            raise LLVMManagerError("Dependency installation was cancelled") from error
         if response not in {"y", "yes"}:
             print("Dependency installation skipped.")
             return report
@@ -491,5 +429,5 @@ def require_build_dependencies(report: DependencyReport) -> None:
     missing = ", ".join(report.missing_names)
     raise LLVMManagerError(
         f"LLVM cannot be built until these dependencies are installed: {missing}. "
-        "Run `python3 llvm_manager.py find-tools` after installing them to verify the setup."
+        "Run `llvm-manager find-tools` after installing them to verify the setup."
     )

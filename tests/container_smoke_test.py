@@ -119,8 +119,10 @@ import sys
 if '--version' in sys.argv:
     print('clang version 22.1.8 (llvm-manager container simulation)')
     raise SystemExit(0)
-if '-c' in sys.argv and '-o' in sys.argv:
-    pathlib.Path(sys.argv[sys.argv.index('-o') + 1]).write_bytes(b'fake object')
+if '-o' in sys.argv:
+    output = pathlib.Path(sys.argv[sys.argv.index('-o') + 1])
+    output.write_text(chr(35) + '!/bin/sh' + chr(10) + 'exit 0' + chr(10), encoding='utf-8')
+    output.chmod(0o755)
     raise SystemExit(0)
 raise SystemExit(0)
 ''', encoding='utf-8')

@@ -1,6 +1,6 @@
 [project]
 name = "llvm-manager"
-version = "1.5.2"
+dynamic = ["version"]
 description = "Build, install, discover, and switch between LLVM versions"
 requires-python = ">=3.10"
 
@@ -13,3 +13,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 packages = ["llvm_mgr"]
+
+[tool.setuptools.dynamic]
+version = {attr = "llvm_mgr.__version__"}

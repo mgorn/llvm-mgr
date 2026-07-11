@@ -4,17 +4,14 @@ import json
 import os
 import platform
 import re
-import shutil
-import subprocess
 import sys
 import tempfile
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Iterable, Mapping
 
-from .util import LLVMManagerError
+from .util import LLVMManagerError, extract_numeric_version, probe_process, probe_text, shutil_which
 
-_VERSION_RE = re.compile(r"(?<!\d)(\d+(?:\.\d+){0,3})(?!\d)")
 _SAFE_ID_RE = re.compile(r"[^a-z0-9]+")
 _COMPILER_EXECUTABLE_RE = re.compile(
     r"(?:cc|c\+\+|cl|clang-cl|clang(?:\+\+)?(?:-\d+(?:\.\d+)*)?|gcc(?:-\d+(?:\.\d+)*)?|g\+\+(?:-\d+(?:\.\d+)*)?)"
@@ -52,18 +49,7 @@ def _safe_identifier(value: str) -> str:
 
 
 def _run_probe(command: list[str], env: Mapping[str, str] | None = None) -> str:
-    try:
-        completed = subprocess.run(
-            command,
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=10,
-            env=dict(env) if env is not None else None,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return ""
-    return "\n".join(part for part in (completed.stdout, completed.stderr) if part).strip()
+    return probe_text(command, env=env)
 
 
 def _compiler_usable(
@@ -98,37 +84,15 @@ def _compiler_usable(
 
         compiler_environment = dict(env) if env is not None else None
         for command in commands:
-            try:
-                completed = subprocess.run(
-                    command,
-                    cwd=root,
-                    text=True,
-                    capture_output=True,
-                    check=False,
-                    timeout=30,
-                    env=compiler_environment,
-                )
-            except (OSError, subprocess.TimeoutExpired):
-                return False
-            if completed.returncode != 0:
+            completed = probe_process(command, cwd=root, env=compiler_environment, timeout=30)
+            if completed is None or completed.returncode != 0:
                 return False
 
         for output in (c_output, cxx_output):
             if not output.is_file():
                 return False
-            try:
-                completed = subprocess.run(
-                    [str(output)],
-                    cwd=root,
-                    text=True,
-                    capture_output=True,
-                    check=False,
-                    timeout=10,
-                    env=compiler_environment,
-                )
-            except (OSError, subprocess.TimeoutExpired):
-                return False
-            if completed.returncode != 0:
+            completed = probe_process([output], cwd=root, env=compiler_environment, timeout=10)
+            if completed is None or completed.returncode != 0:
                 return False
         return True
 
@@ -159,8 +123,7 @@ def _compiler_description(path: Path, env: Mapping[str, str] | None = None) -> t
         family = "unknown"
         name = path.stem
 
-    version_match = _VERSION_RE.search(output)
-    return family, version_match.group(1) if version_match else None, name
+    return family, extract_numeric_version(output), name
 
 
 def _is_compiler_executable_name(name: str) -> bool:
@@ -283,7 +246,7 @@ def _path_toolchains(search_path: str) -> list[HostToolchain]:
 
 
 def _find_vswhere() -> Path | None:
-    found = shutil.which("vswhere.exe") or shutil.which("vswhere")
+    found = shutil_which("vswhere.exe") or shutil_which("vswhere")
     if found:
         return Path(found).resolve()
     program_files = os.environ.get("ProgramFiles(x86)") or os.environ.get("ProgramFiles")
@@ -304,16 +267,10 @@ def _msvc_architecture() -> str:
 
 def _load_batch_environment(script: Path, arguments: tuple[str, ...]) -> dict[str, str]:
     command = f'call "{script}" {" ".join(arguments)} >nul && set'
-    try:
-        completed = subprocess.run(
-            ["cmd.exe", "/d", "/s", "/c", command],
-            text=True,
-            capture_output=True,
-            check=True,
-            timeout=30,
-        )
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
-        raise LLVMManagerError(f"Could not initialize the MSVC environment from {script}: {error}") from error
+    completed = probe_process(["cmd.exe", "/d", "/s", "/c", command], timeout=30)
+    if completed is None or completed.returncode != 0:
+        detail = completed.stderr.strip() if completed is not None else "process could not be started"
+        raise LLVMManagerError(f"Could not initialize the MSVC environment from {script}: {detail}")
 
     environment = os.environ.copy()
     for line in completed.stdout.splitlines():
@@ -330,27 +287,27 @@ def _visual_studio_toolchains() -> list[HostToolchain]:
     vswhere = _find_vswhere()
     if vswhere is None:
         return []
-    try:
-        completed = subprocess.run(
-            [
-                str(vswhere),
-                "-all",
-                "-products",
-                "*",
-                "-requires",
-                "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
-                "-format",
-                "json",
-                "-utf8",
-            ],
-            text=True,
-            capture_output=True,
-            check=True,
-            timeout=20,
-        )
-        instances = json.loads(completed.stdout)
-    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError):
+    completed = probe_process(
+        [
+            vswhere,
+            "-all",
+            "-products",
+            "*",
+            "-requires",
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+            "-format",
+            "json",
+            "-utf8",
+        ],
+        timeout=20,
+    )
+    if completed is None or completed.returncode != 0:
         return []
+    try:
+        instances = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return []
+
 
     results: list[HostToolchain] = []
     architecture = _msvc_architecture()
@@ -364,7 +321,7 @@ def _visual_studio_toolchains() -> list[HostToolchain]:
             environment = _load_batch_environment(script, arguments)
         except LLVMManagerError:
             continue
-        compiler = shutil.which("cl.exe", path=environment.get("PATH"))
+        compiler = shutil_which("cl.exe", environment.get("PATH"))
         if not compiler:
             continue
         compiler_path = Path(compiler).resolve()
@@ -394,21 +351,14 @@ def _visual_studio_toolchains() -> list[HostToolchain]:
 def _xcrun_toolchains() -> list[HostToolchain]:
     if sys.platform != "darwin":
         return []
-    xcrun = shutil.which("xcrun")
+    xcrun = shutil_which("xcrun")
     if not xcrun:
         return []
 
     paths: dict[str, Path] = {}
     for language, compiler in (("cc", "clang"), ("cxx", "clang++")):
-        try:
-            completed = subprocess.run(
-                [xcrun, "--find", compiler],
-                text=True,
-                capture_output=True,
-                check=True,
-                timeout=10,
-            )
-        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        completed = probe_process([xcrun, "--find", compiler], timeout=10)
+        if completed is None or completed.returncode != 0:
             return []
         candidate = Path(completed.stdout.strip())
         if not candidate.is_file():
@@ -494,15 +444,10 @@ def toolchain_environment(toolchain: HostToolchain) -> dict[str, str]:
 
 
 def print_host_toolchains(toolchains: list[HostToolchain]) -> None:
-    if not toolchains:
-        print("No usable host C/C++ compiler toolchains were found.")
-        return
-    print("Available host compiler toolchains:")
-    for index, toolchain in enumerate(toolchains, start=1):
-        print(f"  {index:>2}) {toolchain.label}")
-        if toolchain.cxx != toolchain.cc:
-            print(f"      C++: {toolchain.cxx}")
-        print(f"      ID: {toolchain.identifier}; source: {toolchain.source}")
+    # Compatibility wrapper; terminal rendering lives in presentation.py.
+    from .presentation import print_host_toolchains as render
+
+    render(toolchains)
 
 
 def select_host_toolchain(toolchains: list[HostToolchain], selector: str) -> HostToolchain:

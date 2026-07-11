@@ -5,18 +5,19 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 from .builder import BuildOptions, build_and_install
-from .config import ManagerPaths
+from .config import ManagerPaths, default_manager_root
 from .dependencies import (
+    DependencyReport,
     check_build_dependencies,
     offer_dependency_install,
-    print_dependency_report,
     require_build_dependencies,
 )
-from .discovery import print_installs, scan_installs
+from .discovery import inspect_install, scan_installs
 from .models import InstallInfo
+from .presentation import print_dependency_report, print_installs
 from .repository import (
     DEFAULT_REPOSITORY_URL,
     RevisionKind,
@@ -24,16 +25,20 @@ from .repository import (
     fetch_release_tags,
     fetch_remote_branches,
 )
-from .switcher import switch_install
-from .toolchains import (
-    HostToolchain,
-    prompt_for_host_toolchain,
-    select_host_toolchain,
-)
-from .util import LLVMManagerError
+from .switcher import activation_script, switch_install
+from .toolchains import HostToolchain, prompt_for_host_toolchain, select_host_toolchain
+from .util import LLVMManagerError, set_command_echo
 from .versioning import LLVMVersion, latest_per_major, normalize_tag
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+def _prompt(message: str, *, default: str | None = None) -> str:
+    try:
+        value = input(message).strip()
+    except EOFError as error:
+        raise LLVMManagerError("Interactive input ended unexpectedly; provide the required option on the command line") from error
+    except KeyboardInterrupt as error:
+        raise LLVMManagerError("Operation cancelled") from error
+    return value or (default or "")
 
 
 def _csv_tuple(value: str) -> tuple[str, ...]:
@@ -41,30 +46,14 @@ def _csv_tuple(value: str) -> tuple[str, ...]:
 
 
 def _paths(arguments: argparse.Namespace) -> ManagerPaths:
-    return ManagerPaths.create(Path(arguments.root), Path(arguments.home) if arguments.home else None)
+    root = Path(arguments.root) if arguments.root else None
+    home = Path(arguments.home) if arguments.home else None
+    return ManagerPaths.create(root, home)
 
 
-def _find_install(installs: list[InstallInfo], selector: str) -> InstallInfo:
-    selector = selector.strip()
-    if selector.isdigit():
-        index = int(selector)
-        if 1 <= index <= len(installs):
-            return installs[index - 1]
-
-    candidate_path = Path(selector).expanduser()
-    if candidate_path.exists():
-        resolved = candidate_path.resolve()
-        if resolved.name.lower() == "bin":
-            resolved = resolved.parent
-        for install in installs:
-            if install.prefix == resolved:
-                return install
-        clang = resolved / "bin" / ("clang.exe" if os.name == "nt" else "clang")
-        if clang.is_file():
-            return InstallInfo(resolved, clang, None, managed=False)
-
+def _version_matches(installs: list[InstallInfo], selector: str) -> list[InstallInfo]:
     normalized = selector.removeprefix("llvmorg-")
-    matches = [
+    return [
         install
         for install in installs
         if install.version
@@ -74,8 +63,32 @@ def _find_install(installs: list[InstallInfo], selector: str) -> InstallInfo:
             or install.tag == selector
         )
     ]
+
+
+def _find_install(installs: list[InstallInfo], selector: str) -> InstallInfo:
+    selector = selector.strip()
+    if not selector:
+        raise LLVMManagerError("An install selector is required")
+
+    candidate_path = Path(selector).expanduser()
+    if candidate_path.exists():
+        inspected = inspect_install(candidate_path)
+        if inspected is None:
+            raise LLVMManagerError(f"No usable Clang installation was found at {candidate_path}")
+        for install in installs:
+            if install.prefix == inspected.prefix:
+                return install
+        return inspected
+
+    matches = _version_matches(installs, selector)
     if matches:
         return max(matches, key=lambda item: item.version or LLVMVersion(0, 0, 0))
+
+    index_text = selector.removeprefix("#") if selector.startswith("#") else selector
+    if index_text.isdigit():
+        index = int(index_text)
+        if 1 <= index <= len(installs):
+            return installs[index - 1]
     raise LLVMManagerError(f"No installed LLVM matches {selector!r}")
 
 
@@ -92,7 +105,7 @@ def _select_tag(versions: list[LLVMVersion]) -> str:
     choices = _print_tag_choices(versions)
     available = {version.tag: version for version in versions}
     while True:
-        selection = input("LLVM version: ").strip()
+        selection = _prompt("LLVM version: ")
         if selection.lower() == "all":
             for version in versions:
                 print(version.tag)
@@ -105,12 +118,11 @@ def _select_tag(versions: list[LLVMVersion]) -> str:
         print("That tag was not in the fetched release list. Try again.")
 
 
-
 def _prepare_build_dependencies(
     *,
     install_missing: bool = False,
     prompt_install: bool = True,
-):
+) -> DependencyReport:
     report = check_build_dependencies()
     print_dependency_report(report)
     if not report.ready:
@@ -150,7 +162,7 @@ def _select_branch(branches: list[str]) -> str:
     for index, branch in enumerate(branches, start=1):
         print(f"  {index:>2}) {branch}")
     while True:
-        selection = input("LLVM branch: ").strip()
+        selection = _prompt("LLVM branch: ")
         if selection.isdigit() and 1 <= int(selection) <= len(branches):
             return branches[int(selection) - 1]
         if selection in branches:
@@ -164,14 +176,29 @@ def _select_revision(repository_url: str) -> SourceRevision:
         print("  1) Release tag")
         print("  2) Branch")
         print("  3) Commit")
-        selection = input("Select a source type [1]: ").strip() or "1"
+        selection = _prompt("Select a source type [1]: ", default="1")
         if selection == "1":
             return SourceRevision(RevisionKind.TAG, _select_tag(fetch_release_tags(repository_url)))
         if selection == "2":
             return SourceRevision(RevisionKind.BRANCH, _select_branch(fetch_remote_branches(repository_url)))
         if selection == "3":
-            return SourceRevision(RevisionKind.COMMIT, input("Commit ID: ").strip())
+            return SourceRevision(RevisionKind.COMMIT, _prompt("Commit ID: "))
         print("Choose 1, 2, or 3.")
+
+
+def _revision_from_arguments(arguments: argparse.Namespace) -> SourceRevision:
+    selected = sum(bool(value) for value in (arguments.tag, arguments.branch, arguments.commit))
+    if selected > 1:
+        raise LLVMManagerError("Choose exactly one of a release tag, --branch, or --commit")
+    if arguments.branch:
+        return SourceRevision(RevisionKind.BRANCH, arguments.branch)
+    if arguments.commit:
+        return SourceRevision(RevisionKind.COMMIT, arguments.commit)
+    if arguments.tag:
+        return SourceRevision(RevisionKind.TAG, arguments.tag)
+    if not sys.stdin.isatty():
+        raise LLVMManagerError("A source revision is required in noninteractive mode; provide a tag, --branch, or --commit")
+    return _select_revision(arguments.repo_url)
 
 
 def _default_install(paths: ManagerPaths, revision: SourceRevision) -> Path:
@@ -179,15 +206,13 @@ def _default_install(paths: ManagerPaths, revision: SourceRevision) -> Path:
 
 
 def _interactive_build(paths: ManagerPaths, repository_url: str) -> Path:
-    host_toolchain = _choose_host_toolchain(None, prompt_install=True)
     revision = _select_revision(repository_url)
+    host_toolchain = _choose_host_toolchain(None, prompt_install=True)
     default = _default_install(paths, revision)
-    response = input(f"Install directory [{default}]: ").strip()
+    response = _prompt(f"Install directory [{default}]: ")
     install_prefix = Path(response).expanduser() if response else default
-    target_response = input("LLVM targets to build [Native; enter 'all' for every backend]: ").strip()
-    targets = target_response or "Native"
-    jobs_response = input(f"Parallel build jobs [{max(1, os.cpu_count() or 1)}]: ").strip()
-    jobs = int(jobs_response) if jobs_response else max(1, os.cpu_count() or 1)
+    targets = _prompt("LLVM targets to build [Native; enter 'all' for every backend]: ", default="Native")
+    jobs = int(_prompt(f"Parallel build jobs [{max(1, os.cpu_count() or 1)}]: ", default=str(max(1, os.cpu_count() or 1))))
     return build_and_install(
         paths,
         BuildOptions(
@@ -202,107 +227,87 @@ def _interactive_build(paths: ManagerPaths, repository_url: str) -> Path:
 
 
 def _menu(paths: ManagerPaths, repository_url: str) -> int:
+    if not sys.stdin.isatty():
+        raise LLVMManagerError("The interactive menu requires a terminal; choose a subcommand instead")
     while True:
         print("\nLLVM Manager")
-        print("1) Check for existing installs")
-        print("2) Display the installed versions")
-        print("3) Switch installed version")
-        print("4) Build & install an LLVM source revision")
-        print("5) Exit")
-        choice = input("Select an option: ").strip()
-
+        print("1) Display installed versions")
+        print("2) Switch installed version")
+        print("3) Build & install an LLVM source revision")
+        print("4) Exit")
+        choice = _prompt("Select an option: ")
         if choice == "1":
             installs = scan_installs(paths)
             print(f"Found {len(installs)} LLVM/Clang installation(s).")
+            print_installs(installs)
         elif choice == "2":
-            print_installs(scan_installs(paths))
-        elif choice == "3":
             installs = scan_installs(paths)
             print_installs(installs)
-            if not installs:
-                continue
-            selected = _find_install(installs, input("Version, list number, or install path: "))
-            profile = switch_install(paths, selected)
-            print(f"Selected {selected.label}")
-            if profile:
-                print(f"Updated {profile}. Open a new shell or run: source {profile}")
-            else:
-                print("Updated the user environment. Open a new terminal to use it.")
+            if installs:
+                selected = _find_install(installs, _prompt("Version, #list-number, or install path: "))
+                profile = switch_install(paths, selected)
+                _print_switch_result(paths, selected, profile)
+        elif choice == "3":
+            print(f"Installed LLVM at {_interactive_build(paths, repository_url)}")
         elif choice == "4":
-            prefix = _interactive_build(paths, repository_url)
-            print(f"Installed LLVM at {prefix}")
-        elif choice == "5":
             return 0
         else:
-            print("Choose 1, 2, 3, 4, or 5.")
+            print("Choose 1, 2, 3, or 4.")
 
 
 def build_parser() -> argparse.ArgumentParser:
+    default_root = default_manager_root()
     parser = argparse.ArgumentParser(
         prog="llvm-manager",
         description="Download, build, install, discover, and switch versioned LLVM/Clang toolchains.",
     )
-    parser.add_argument("--root", default=str(PROJECT_ROOT), help="Manager data root (default: script directory)")
+    parser.add_argument("--root", type=Path, help=f"Manager data root (default: {default_root})")
     parser.add_argument("--home", help=argparse.SUPPRESS)
     parser.add_argument("--repo-url", default=DEFAULT_REPOSITORY_URL, help="LLVM Git repository URL")
+    parser.add_argument("--quiet", action="store_true", help="Do not echo external commands")
     subcommands = parser.add_subparsers(dest="command")
 
     subcommands.add_parser("menu", help="Open the interactive menu")
-
-    scan = subcommands.add_parser("scan", help="Scan for managed and external LLVM installs")
-    scan.add_argument("--json", action="store_true", help="Print machine-readable JSON")
-
-    listing = subcommands.add_parser("list", help="Display installed LLVM versions")
-    listing.add_argument("--json", action="store_true", help="Print machine-readable JSON")
+    for name, help_text in (
+        ("scan", "Scan for managed and external LLVM installs"),
+        ("list", "Display installed LLVM versions"),
+    ):
+        command = subcommands.add_parser(name, help=help_text)
+        command.add_argument("--json", action="store_true", help="Print machine-readable JSON")
 
     find_tools = subcommands.add_parser("find-tools", help="Check LLVM build dependencies and find host compilers")
     find_tools.add_argument("--json", action="store_true", help="Print machine-readable JSON")
-    find_tools.add_argument(
-        "--install-missing",
-        action="store_true",
-        help="Run the suggested dependency installer without asking for confirmation",
-    )
-    find_tools.add_argument(
-        "--no-install-prompt",
-        action="store_true",
-        help="Report missing dependencies without offering to install them",
-    )
+    find_tools.add_argument("--install-missing", action="store_true", help="Run the suggested dependency installer without asking")
+    find_tools.add_argument("--no-install-prompt", action="store_true", help="Do not offer to install missing dependencies")
 
     tags = subcommands.add_parser("tags", help="Fetch LLVM release tags")
-    tags.add_argument("--all", action="store_true", help="Show every release instead of latest per major")
-    tags.add_argument("--include-prerelease", action="store_true", help="Include release candidates")
+    tags.add_argument("--all", action="store_true", help="Print every release instead of one per major")
+    tags.add_argument("--include-prerelease", action="store_true", help="Include RC and development tags")
 
-    switch = subcommands.add_parser("switch", help="Select an installed LLVM version")
-    switch.add_argument("selector", nargs="?", help="List number, major/full version, tag, or install prefix")
-    switch.add_argument("--shell", help="Shell executable/name used to select the profile")
+    switch = subcommands.add_parser("switch", help="Activate an installed LLVM version")
+    switch.add_argument("selector", nargs="?", help="Version, #list-number, or installation prefix")
+    switch.add_argument("--shell", help="Shell executable/name")
     switch.add_argument("--profile", type=Path, help="Explicit shell profile to update")
 
-    build = subcommands.add_parser("build", help="Fetch, build, and install LLVM from a tag, branch, or commit")
-    build.add_argument("tag", nargs="?", help="LLVM release tag or version, for example llvmorg-22.1.8 or 22.1.8")
+    activate = subcommands.add_parser("activate", help="Show the generated activation script for the selected LLVM")
+    activate.add_argument("--shell", help="Shell name (bash, zsh, fish, pwsh, or powershell)")
+
+    build = subcommands.add_parser("build", help="Build and install an LLVM source revision")
+    build.add_argument("tag", nargs="?", help="LLVM release version or tag, for example 22.1.8")
     revision = build.add_mutually_exclusive_group()
-    revision.add_argument("--branch", help="Build the current commit of a remote branch, for example main or release/22.x")
+    revision.add_argument("--branch", help="Build the current commit of a remote branch")
     revision.add_argument("--commit", help="Build an exact 7- to 40-character hexadecimal commit ID")
     build.add_argument("--install-dir", type=Path, help="Versioned installation prefix")
-    build.add_argument(
-        "--toolchain",
-        help="Host compiler list number, ID, family, name, or compiler path; prompts when omitted",
-    )
+    build.add_argument("--toolchain", help="Host compiler list number, ID, family, name, or compiler path")
     build.add_argument("--build-type", default="Release", choices=["Debug", "Release", "RelWithDebInfo", "MinSizeRel"])
     build.add_argument("--projects", default="clang,clang-tools-extra,lld", help="Comma-separated LLVM projects")
     build.add_argument("--runtimes", default="compiler-rt", help="Comma-separated LLVM runtimes; empty disables")
     build.add_argument("--targets", default="Native", help="LLVM targets, semicolon-separated, or 'all'")
     build.add_argument("--jobs", type=int, default=max(1, os.cpu_count() or 1))
-    build.add_argument("--no-verify", action="store_true", help="Skip clang version and compile checks")
-    build.add_argument(
-        "--install-missing",
-        action="store_true",
-        help="Run the suggested dependency installer without asking for confirmation",
-    )
-    build.add_argument(
-        "--no-install-prompt",
-        action="store_true",
-        help="Do not offer to install missing build dependencies",
-    )
+    build.add_argument("--clean", action="store_true", help="Clean the build directory and manager-owned install before building")
+    build.add_argument("--no-verify", action="store_true", help="Skip installed compiler link and execution checks")
+    build.add_argument("--install-missing", action="store_true", help="Run the suggested dependency installer without asking")
+    build.add_argument("--no-install-prompt", action="store_true", help="Do not offer to install missing dependencies")
     build.add_argument("--switch", action="store_true", help="Switch to the new install after a successful build")
     build.add_argument("--shell", help="Shell executable/name when used with --switch")
     build.add_argument("--profile", type=Path, help="Explicit shell profile when used with --switch")
@@ -313,111 +318,137 @@ def _json_installs(installs: list[InstallInfo]) -> None:
     print(json.dumps([install.to_json() for install in installs], indent=2))
 
 
+def _print_switch_result(paths: ManagerPaths, selected: InstallInfo, profile: Path | None) -> None:
+    print(f"Selected {selected.label}")
+    if profile:
+        print(f"Updated {profile}. Open a new shell or run: source {profile}")
+    else:
+        print("Updated the user environment. Open a new terminal to use it.")
+        print(f"PowerShell activation script: {paths.activation_ps1}")
+
+
+def _handle_list(arguments: argparse.Namespace, paths: ManagerPaths) -> int:
+    installs = scan_installs(paths)
+    if arguments.json:
+        _json_installs(installs)
+    else:
+        if arguments.command == "scan":
+            print(f"Found {len(installs)} LLVM/Clang installation(s).")
+        print_installs(installs)
+    return 0
+
+
+def _handle_find_tools(arguments: argparse.Namespace, paths: ManagerPaths) -> int:
+    del paths
+    if arguments.json and arguments.install_missing:
+        raise LLVMManagerError("--json cannot be combined with --install-missing")
+    report = check_build_dependencies()
+    if arguments.json:
+        print(json.dumps(report.to_json(), indent=2))
+        return 0 if report.ready else 1
+    print_dependency_report(report)
+    if not report.ready:
+        updated = offer_dependency_install(
+            report,
+            assume_yes=arguments.install_missing,
+            prompt=not arguments.no_install_prompt and sys.stdin.isatty(),
+        )
+        if updated is not report:
+            print()
+            print_dependency_report(updated)
+        report = updated
+    return 0 if report.ready else 1
+
+
+def _handle_tags(arguments: argparse.Namespace, paths: ManagerPaths) -> int:
+    del paths
+    versions = fetch_release_tags(arguments.repo_url)
+    if arguments.all:
+        selected = versions if arguments.include_prerelease else [version for version in versions if version.stable]
+    else:
+        selected = latest_per_major(versions, include_prerelease=arguments.include_prerelease)
+    for version in selected:
+        print(version.tag)
+    return 0
+
+
+def _handle_switch(arguments: argparse.Namespace, paths: ManagerPaths) -> int:
+    installs = scan_installs(paths)
+    if not installs:
+        raise LLVMManagerError("No LLVM installations were found")
+    selector = arguments.selector
+    if selector is None:
+        print_installs(installs)
+        selector = _prompt("Version, #list-number, or install path: ")
+    selected = _find_install(installs, selector)
+    profile = switch_install(paths, selected, shell=arguments.shell, profile=arguments.profile)
+    _print_switch_result(paths, selected, profile)
+    return 0
+
+
+def _handle_activate(arguments: argparse.Namespace, paths: ManagerPaths) -> int:
+    script = activation_script(paths, arguments.shell)
+    if not script.is_file():
+        raise LLVMManagerError("No activation script exists yet; switch to an LLVM installation first")
+    print(script)
+    return 0
+
+
+def _handle_build(arguments: argparse.Namespace, paths: ManagerPaths) -> int:
+    source_revision = _revision_from_arguments(arguments)
+    host_toolchain = _choose_host_toolchain(
+        arguments.toolchain,
+        install_missing=arguments.install_missing,
+        prompt_install=not arguments.no_install_prompt and sys.stdin.isatty(),
+    )
+    install_prefix = arguments.install_dir or _default_install(paths, source_revision)
+    prefix = build_and_install(
+        paths,
+        BuildOptions(
+            revision=source_revision,
+            install_prefix=install_prefix,
+            host_toolchain=host_toolchain,
+            build_type=arguments.build_type,
+            projects=_csv_tuple(arguments.projects),
+            runtimes=_csv_tuple(arguments.runtimes),
+            targets=arguments.targets,
+            jobs=arguments.jobs,
+            repository_url=arguments.repo_url,
+            verify=not arguments.no_verify,
+            clean=arguments.clean,
+        ),
+    )
+    print(f"Installed LLVM at {prefix}")
+    if arguments.switch:
+        selected = inspect_install(prefix, managed=True)
+        if selected is None:
+            raise LLVMManagerError(f"The newly installed LLVM could not be inspected: {prefix}")
+        profile = switch_install(paths, selected, shell=arguments.shell, profile=arguments.profile)
+        _print_switch_result(paths, selected, profile)
+    return 0
+
+
+_HANDLERS: dict[str, Callable[[argparse.Namespace, ManagerPaths], int]] = {
+    "scan": _handle_list,
+    "list": _handle_list,
+    "find-tools": _handle_find_tools,
+    "tags": _handle_tags,
+    "switch": _handle_switch,
+    "activate": _handle_activate,
+    "build": _handle_build,
+}
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     arguments = parser.parse_args(argv)
+    set_command_echo(not arguments.quiet)
     paths = _paths(arguments)
     command = arguments.command or "menu"
-
     try:
         if command == "menu":
             return _menu(paths, arguments.repo_url)
-        if command in {"scan", "list"}:
-            installs = scan_installs(paths)
-            if arguments.json:
-                _json_installs(installs)
-            elif command == "scan":
-                print(f"Found {len(installs)} LLVM/Clang installation(s).")
-                print_installs(installs)
-            else:
-                print_installs(installs)
-            return 0
-        if command == "find-tools":
-            if arguments.json and arguments.install_missing:
-                raise LLVMManagerError("--json cannot be combined with --install-missing")
-            report = check_build_dependencies()
-            if arguments.json:
-                print(json.dumps(report.to_json(), indent=2))
-                return 0 if report.ready else 1
-
-            print_dependency_report(report)
-            if not report.ready:
-                updated = offer_dependency_install(
-                    report,
-                    assume_yes=arguments.install_missing,
-                    prompt=not arguments.no_install_prompt and sys.stdin.isatty(),
-                )
-                if updated is not report:
-                    print()
-                    print_dependency_report(updated)
-                report = updated
-            return 0 if report.ready else 1
-        if command == "tags":
-            versions = fetch_release_tags(arguments.repo_url)
-            if not arguments.include_prerelease:
-                versions = [version for version in versions if version.stable]
-            selected = versions if arguments.all else latest_per_major(versions)
-            for version in selected:
-                print(version.tag)
-            return 0
-        if command == "switch":
-            installs = scan_installs(paths)
-            if not installs:
-                raise LLVMManagerError("No LLVM installations were found")
-            selector = arguments.selector
-            if selector is None:
-                print_installs(installs)
-                selector = input("Version, list number, or install path: ")
-            selected = _find_install(installs, selector)
-            profile = switch_install(paths, selected, shell=arguments.shell, profile=arguments.profile)
-            print(f"Selected {selected.label}")
-            if profile:
-                print(f"Updated {profile}. Open a new shell or run: source {profile}")
-            else:
-                print("Updated the user environment. Open a new terminal to use it.")
-            return 0
-        if command == "build":
-            host_toolchain = _choose_host_toolchain(
-                arguments.toolchain,
-                install_missing=arguments.install_missing,
-                prompt_install=not arguments.no_install_prompt and sys.stdin.isatty(),
-            )
-            if arguments.tag and (arguments.branch or arguments.commit):
-                raise LLVMManagerError("The positional release tag cannot be combined with --branch or --commit")
-            if arguments.branch:
-                source_revision = SourceRevision(RevisionKind.BRANCH, arguments.branch)
-            elif arguments.commit:
-                source_revision = SourceRevision(RevisionKind.COMMIT, arguments.commit)
-            elif arguments.tag:
-                source_revision = SourceRevision(RevisionKind.TAG, normalize_tag(arguments.tag))
-            else:
-                source_revision = _select_revision(arguments.repo_url)
-            install_prefix = arguments.install_dir or _default_install(paths, source_revision)
-            prefix = build_and_install(
-                paths,
-                BuildOptions(
-                    revision=source_revision,
-                    install_prefix=install_prefix,
-                    host_toolchain=host_toolchain,
-                    build_type=arguments.build_type,
-                    projects=_csv_tuple(arguments.projects),
-                    runtimes=_csv_tuple(arguments.runtimes),
-                    targets=arguments.targets,
-                    jobs=arguments.jobs,
-                    repository_url=arguments.repo_url,
-                    verify=not arguments.no_verify,
-                ),
-            )
-            print(f"Installed LLVM at {prefix}")
-            if arguments.switch:
-                installs = scan_installs(paths)
-                selected = next(install for install in installs if install.prefix == prefix.resolve())
-                profile = switch_install(paths, selected, shell=arguments.shell, profile=arguments.profile)
-                print(f"Selected the new install. Updated {profile}" if profile else "Selected the new install.")
-            return 0
-    except (LLVMManagerError, ValueError, OSError) as error:
+        return _HANDLERS[command](arguments, paths)
+    except (LLVMManagerError, ValueError, OSError, KeyboardInterrupt) as error:
         print(f"llvm-manager: error: {error}", file=sys.stderr)
         return 1
-
-    parser.error(f"Unknown command: {command}")
-    return 2

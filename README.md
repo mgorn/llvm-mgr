@@ -1,201 +1,161 @@
 # LLVM Manager
 
-A dependency-free Python tool for discovering, building, installing, and switching between LLVM/Clang toolchains built from release tags, branches, or exact commits.
+A dependency-free Python 3.10+ tool for discovering, building, installing, and switching between LLVM/Clang toolchains from release tags, branches, or exact commits.
 
-## Requirements
+## Installation and data location
 
-LLVM Manager requires Python 3.10 or newer. Building LLVM additionally requires:
-
-- Git
-- CMake
-- Ninja
-- A working host C and C++ compiler capable of compiling, linking, and running native programs
-- Enough disk space and memory for an LLVM build
-
-Check the complete build environment before doing anything else:
+Run directly from the checkout:
 
 ```sh
-python3 llvm_manager.py find-tools
+python3 llvm_manager.py --help
 ```
 
-The dependency check reports every missing requirement together, lists each validated compiler toolchain, and prints a platform-appropriate package-manager command. In an interactive terminal it then asks before running that command:
-
-```text
-llvm-manager can try to install the missing dependencies with:
-  sudo apt-get update && sudo apt-get install -y cmake ninja-build build-essential
-This may require elevated privileges and can prompt for your sudo password.
-Run the dependency installation command now? [y/N]:
-```
-
-Nothing is installed unless the user answers `y` or `yes`. The command is executed as fixed argument lists rather than through a shell, and the complete dependency check runs again afterward. The build only continues if the recheck succeeds. On Windows, the prompt warns that installation may trigger UAC; on macOS, developer-tool or Homebrew installation may require finishing an external installer before rerunning the check.
-
-For non-interactive use:
+Or install the package:
 
 ```sh
-# Report only; never prompt.
-python3 llvm_manager.py find-tools --no-install-prompt
-
-# Explicitly authorize running the detected installer without another prompt.
-python3 llvm_manager.py find-tools --install-missing
-python3 llvm_manager.py build 22.1.8 --install-missing
-
-# Machine-readable report; this never prompts.
-python3 llvm_manager.py find-tools --json
+python3 -m pip install .
+llvm-manager --help
 ```
 
-The command exits with status 1 whenever the machine is still not ready to build LLVM. `--json` cannot be combined with `--install-missing`, so JSON output remains machine-readable.
+Manager data is stored in a writable per-user data directory by default:
 
-Linux, macOS, and Windows are supported. Unix shells use a managed activation block in the active shell profile. Windows uses the current user's persistent environment variables.
+- Linux: `${XDG_DATA_HOME:-~/.local/share}/llvm-manager`
+- macOS: `~/Library/Application Support/llvm-manager`
+- Windows: `%LOCALAPPDATA%\llvm-manager`
 
-## Start the interactive menu
+Override it with the global `--root` option or the `LLVM_MANAGER_ROOT` environment variable. Read-only commands such as `list` and `scan` do not create the data directory.
+
+## Build requirements
+
+Building LLVM requires Git, CMake, Ninja, and a host C/C++ compiler that can compile, link, and run native programs.
 
 ```sh
-python3 llvm_manager.py
+llvm-manager find-tools
 ```
 
-The first screen is:
+The command reports every missing dependency and, when possible, shows a platform package-manager command. In an interactive terminal it asks before running that command. Automatic installation never uses a shell-composed command and is disabled when required elevation tooling is unavailable.
 
-```text
-LLVM Manager
-1) Check for existing installs
-2) Display the installed versions
-3) Switch installed version
-4) Build & install an LLVM source revision
-5) Exit
+```sh
+# Report only.
+llvm-manager find-tools --no-install-prompt
+
+# Explicitly authorize the detected installer.
+llvm-manager find-tools --install-missing
+llvm-manager build 22.1.8 --install-missing
+
+# Machine-readable and never interactive.
+llvm-manager find-tools --json
 ```
-
-By default, all manager data stays beside the script:
-
-```text
-llvm-manager/
-├── source/llvm-project/
-├── build/llvmorg-22.1.8-Release/
-├── install/llvmorg-22.1.8/
-└── current -> install/llvmorg-22.1.8/
-```
-
-These generated directories are not included in the archive.
 
 ## Commands
 
-All behavior is exposed through the single top-level entry point:
-
 ```sh
-python3 llvm_manager.py find-tools
-python3 llvm_manager.py scan
-python3 llvm_manager.py list
-python3 llvm_manager.py tags
-python3 llvm_manager.py switch 22
-python3 llvm_manager.py build 22.1.8
-python3 llvm_manager.py build --branch main
-python3 llvm_manager.py build --commit 0123456789abcdef
+llvm-manager scan
+llvm-manager list
+llvm-manager list --json
+llvm-manager tags
+llvm-manager tags --include-prerelease
+llvm-manager switch 22
+llvm-manager switch 22.1.8
+llvm-manager switch '#2'
+llvm-manager switch /custom/llvm/prefix
+llvm-manager build 22.1.8
+llvm-manager build --branch main
+llvm-manager build --commit 0123456789abcdef
+llvm-manager activate --shell fish
 ```
 
-Global options such as `--root` and `--repo-url` go before the subcommand:
+A bare number selects an LLVM major when that major exists. Use `#N` to unambiguously select list entry N.
+
+External commands are echoed by default. Add the global `--quiet` option before the subcommand to suppress them:
 
 ```sh
-python3 llvm_manager.py --root "$HOME/.local/llvm-manager" build 22.1.8
+llvm-manager --quiet list
 ```
 
-The implementation lives in the `llvm_mgr/` Python package; there is no separate wrapper-scripts directory.
+Running without a subcommand opens the interactive menu when stdin is a terminal. Noninteractive builds must specify a release tag, `--branch`, or `--commit`.
 
 ## Build behavior
 
-Before fetching tags or branches, cloning source, or configuring CMake, the build command runs the same dependency check as `find-tools`. When requirements are missing in an interactive terminal, it shows the exact installation command, warns about sudo/administrator elevation, and asks whether to run it. It then rechecks the environment and will not start source work while Git, CMake, Ninja, or a usable C/C++ compiler toolchain is still missing.
-
-A default build uses:
+A default build enables:
 
 - `clang`, `clang-tools-extra`, and `lld`
 - `compiler-rt`
 - `Release`
 - Ninja
-- The native LLVM target only
+- The native LLVM target
 - `cmake --build ... --target install`
 
-On macOS, LLVM Manager also configures Clang with `-DCLANG_USE_XCSELECT=ON`.
-This enables the Darwin driver to discover the active Apple SDK and its libc++
-headers without requiring callers to add `-isysroot` or a manual libc++ include
-path to every compile command.
-
-The default install prefix identifies the requested source revision:
-
-- Release tag: `./install/llvmorg-22.1.8/`
-- Branch: `./install/branch-main/` or `./install/branch-release-22.x/`
-- Commit: `./install/commit-0123456789ab/`
-
-The interactive flow first asks whether to build a release tag, remote branch, or exact commit, and then asks before using the default prefix. Branch names are selected from the remote branch list. Commit IDs must contain 7 to 40 hexadecimal characters.
+On macOS, Clang is configured with `-DCLANG_USE_XCSELECT=ON` so the Darwin driver can discover the active Apple SDK and libc++ headers.
 
 Examples:
 
 ```sh
-# Build the default native toolchain.
-python3 llvm_manager.py build 22.1.8
-
-# Build the current tip of the main branch.
-python3 llvm_manager.py build --branch main
-
-# Build a release branch.
-python3 llvm_manager.py build --branch release/22.x
-
-# Build an exact commit.
-python3 llvm_manager.py build --commit 0123456789abcdef
-
-# Build all LLVM backends with 12 parallel jobs.
-python3 llvm_manager.py build 22.1.8 --targets all --jobs 12
-
-# Build selected backends and switch to the result.
-python3 llvm_manager.py build --branch main \
-  --targets 'X86;AArch64;WebAssembly' \
-  --switch
-
-# Customize projects and runtimes.
-python3 llvm_manager.py build 22.1.8 \
-  --projects clang,clang-tools-extra,lld \
-  --runtimes compiler-rt
+llvm-manager build 22.1.8
+llvm-manager build --branch release/22.x
+llvm-manager build 22.1.8 --targets all --jobs 12
+llvm-manager build --branch main --targets 'X86;AArch64;WebAssembly' --switch
+llvm-manager build 22.1.8 --projects clang,clang-tools-extra,lld --runtimes compiler-rt
+llvm-manager build 22.1.8 --install-dir /custom/llvm-22 --switch
 ```
 
-After checking out the selected revision, the manager reads `LLVM_VERSION_MAJOR` from LLVM's monorepo-level `cmake/Modules/LLVMVersion.cmake`, with fallbacks for older or downstream layouts. It then creates major-version aliases for installed executables. For LLVM 22, examples include `clang-22`, `clang++-22`, `llvm-config-22`, and `ld.lld-22`. Unix uses relative symbolic links; Windows uses hard links when possible and copies as a fallback.
+The resolved Git commit, build configuration, selected host toolchain, and installed-file manifest are recorded in `.llvm-manager.json`. Build directories are automatically reset when their configuration changes. `--clean` explicitly clears the build directory and a manager-owned install before rebuilding; it refuses to recursively delete an unrecognized custom prefix.
 
-The installation is verified by running `clang-<major> --version`, compiling a
-small C source file, and compiling a C++20 source file that includes
-`<concepts>`. The C++ check catches missing SDK or standard-library header search
-paths that a C-only verification would otherwise miss.
+CMake is given the exact discovered compiler and Ninja paths, avoiding a second inconsistent PATH lookup.
+
+### Verification
+
+After installation, LLVM Manager:
+
+1. Creates and validates major-version aliases for known LLVM tools, such as `clang-22`, `clang++-22`, `llvm-config-22`, and `ld.lld-22`.
+2. Runs `clang-<major> --version`.
+3. Compiles and links a C executable.
+4. Compiles and links a C++20 executable that includes `<concepts>`.
+5. Runs both executables for native builds.
+
+Use `--no-verify` only when the target cannot run on the host or verification must be handled separately.
 
 ## Switching versions
 
 ```sh
-python3 llvm_manager.py switch 22
-python3 llvm_manager.py switch 22.1.8
-python3 llvm_manager.py switch llvmorg-22.1.8
-python3 llvm_manager.py switch /custom/prefix
+llvm-manager switch 22
+llvm-manager switch llvmorg-22.1.8
+llvm-manager switch /custom/prefix
 ```
 
-On Bash, Zsh, and other POSIX shells, switching updates the `current` symbolic link, writes `activate.sh`, and adds one idempotent managed block to the active shell's profile. Fish gets `activate.fish`. The activation defines:
+On POSIX systems, switching atomically updates `current`, writes activation scripts, and maintains one managed block in the selected shell profile. Bash, Zsh, POSIX shells, and Fish use shell-specific rendering. Existing malformed or duplicate managed blocks are repaired.
 
-- `LLVM_HOME`
-- `PATH`
-- `CC`
-- `CXX`
+On Windows, switching updates the current user's `Path`, `LLVM_HOME`, `CC`, and `CXX`. Only the exact previously active manager path is removed; unrelated PATH entries containing similar text are preserved.
 
-Open a new shell after switching, or source the profile printed by the command.
+The generated scripts are:
 
-On Windows, switching updates the current user's persistent `Path`, `LLVM_HOME`, `CC`, and `CXX` values. Open a new terminal afterward.
+- `activate.sh`
+- `activate.fish`
+- `activate.ps1`
+
+Show the appropriate script path with:
+
+```sh
+llvm-manager activate --shell bash
+llvm-manager activate --shell fish
+llvm-manager activate --shell pwsh
+```
+
+Switch state, profiles, symlinks, activation scripts, and Windows environment changes are guarded by a manager lock and rolled back when a later commit step fails.
 
 ## Source checkout safety
 
-The manager uses one checkout at `source/llvm-project`. Before changing tags, branches, or commits, it checks for modified or untracked files and refuses to overwrite them. Commit, stash, or remove local changes before retrying.
+The manager uses one checkout at `source/llvm-project`. A manager-wide file lock prevents concurrent builds or switches from changing shared state underneath one another. Before changing revisions, the manager refuses to proceed when the checkout contains modified or untracked files.
 
-Tag and branch selections are resolved to a full commit before checkout. Builds use detached HEAD mode so selecting a branch never modifies or creates a local branch. The installation metadata records the requested source kind/value and the exact resolved commit hash, making moving branch builds traceable.
-
-## Compatibility note
-
-The build logic targets LLVM's modern monorepo CMake layout. Current and reasonably recent release tags and branches use this layout. Very old historical tags may require version-specific CMake options or source-tree arrangements and can fail with a clear error rather than being modified destructively.
+Tags, branches, and commits are resolved to a full commit and checked out in detached-HEAD mode. Release-tag syntax is validated before dependency probing or repository work begins.
 
 ## Tests
 
 ```sh
 python3 -m unittest discover -v
 python3 tests/container_smoke_test.py
+# or both:
+python3 run_tests.py
 ```
 
-The smoke test creates a temporary local Git repository and a fake CMake installer. It exercises dependency reporting, compiler discovery and validation, tag fetching, cloning, revision checkout, configuration, installation, numbered aliases, compiler verification, version switching, shell-profile editing, and install rediscovery without attempting a multi-hour LLVM compilation.
+The unit suite covers dependency planning, compiler discovery, install inspection, version selection, alias correction, build invalidation, shell rendering, transactional rollback, JSON/profile recovery, and CLI regressions. The smoke test exercises dependency discovery, tag and branch checkout, configure, install, alias creation, link/run verification, switching, and rediscovery. GitHub Actions runs the unit suite on Linux, macOS, and Windows with Python 3.10 and 3.13.
