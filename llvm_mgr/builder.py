@@ -37,7 +37,7 @@ class BuildOptions:
     build_type: str = "Release"
     projects: tuple[str, ...] = ("clang", "clang-tools-extra", "lld")
     runtimes: tuple[str, ...] = ("compiler-rt",)
-    targets: str = "Native"
+    targets: str = "all"
     jobs: int = max(1, os.cpu_count() or 1)
     repository_url: str = DEFAULT_REPOSITORY_URL
     cxx_standard_library: str = SYSTEM_CXX_STANDARD_LIBRARY
@@ -208,7 +208,7 @@ def _configure_command(
     if runtimes:
         command.append(f"-DLLVM_ENABLE_RUNTIMES={_cmake_list(runtimes)}")
     command.extend(standard_library_cmake_options(options.cxx_standard_library))
-    if options.targets and options.targets.lower() != "all":
+    if options.targets:
         command.append(f"-DLLVM_TARGETS_TO_BUILD={options.targets}")
     return command
 
@@ -342,7 +342,7 @@ def build_and_install(paths: ManagerPaths, options: BuildOptions) -> Path:
                 install_prefix,
                 major,
                 build_env,
-                run_executables=options.targets.strip().lower() == "native",
+                run_executables=options.targets.strip().lower() in {"all", "host", "native"},
             )
 
         metadata = {

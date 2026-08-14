@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from llvm_mgr.aliases import ensure_versioned_binaries
 from llvm_mgr.builder import _prepare_build_directory, _verify_install
-from llvm_mgr.cli import _find_install, main
+from llvm_mgr.cli import _find_install, build_parser, main
 from llvm_mgr.config import ManagerPaths, default_manager_root
 from llvm_mgr.dependencies import DependencyReport
 from llvm_mgr.discovery import _candidate_clang, inspect_install, scan_installs
@@ -90,6 +90,10 @@ class SelectorQualityTests(unittest.TestCase):
 
 
 class CLIQualityTests(unittest.TestCase):
+    def test_build_defaults_to_all_llvm_targets(self) -> None:
+        arguments = build_parser().parse_args(["build", "22.1.8"])
+        self.assertEqual(arguments.targets, "all")
+
     def test_invalid_revision_is_rejected_before_dependency_probe(self) -> None:
         errors = io.StringIO()
         with patch("llvm_mgr.cli.check_build_dependencies") as dependencies, contextlib.redirect_stderr(errors):

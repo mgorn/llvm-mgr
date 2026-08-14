@@ -84,7 +84,7 @@ A default build enables:
 - `compiler-rt`
 - `Release`
 - Ninja
-- The native LLVM target
+- All non-experimental LLVM targets/backends available in the selected source revision
 - `cmake --build ... --target install`
 
 On macOS, Clang is configured with `-DCLANG_USE_XCSELECT=ON` so the Darwin driver can discover the active Apple SDK. By default, C++ compilation continues to use the libc++ supplied by that SDK.
@@ -94,7 +94,8 @@ Examples:
 ```sh
 llvm-manager build 22.1.8
 llvm-manager build --branch release/22.x
-llvm-manager build 22.1.8 --targets all --jobs 12
+llvm-manager build 22.1.8 --jobs 12
+llvm-manager build 22.1.8 --targets Native
 llvm-manager build --branch main --targets 'X86;AArch64;WebAssembly' --switch
 llvm-manager build 22.1.8 --projects clang,clang-tools-extra,lld --runtimes compiler-rt
 llvm-manager build 22.1.8 --stdlib managed-libc++ --switch
@@ -138,7 +139,7 @@ After installation, LLVM Manager:
 2. Runs `clang-<major> --version`.
 3. Compiles and links a C executable.
 4. Compiles and links a C++20 executable that includes `<concepts>`, using the paired libc++ configuration when selected.
-5. Runs both executables for native builds.
+5. Runs both executables when the target selection guarantees the host backend (`all`, `Native`, or `host`).
 
 Use `--no-verify` only when the target cannot run on the host or verification must be handled separately.
 

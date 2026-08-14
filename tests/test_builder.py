@@ -55,6 +55,55 @@ class BuilderPlatformTests(unittest.TestCase):
         self.assertEqual(_host_cmake_options("win32"), ())
 
 
+class BuilderTargetTests(unittest.TestCase):
+    def _host(self) -> HostToolchain:
+        return HostToolchain(
+            "clang",
+            "Clang",
+            "clang",
+            Path("/host/clang"),
+            Path("/host/clang++"),
+        )
+
+    def test_default_build_enables_all_targets(self) -> None:
+        options = BuildOptions(
+            revision=SourceRevision(RevisionKind.TAG, "22.1.8"),
+            install_prefix=Path("/install"),
+            host_toolchain=self._host(),
+        )
+
+        command = _configure_command(
+            "cmake",
+            "ninja",
+            Path("/source/llvm"),
+            Path("/build"),
+            Path("/install"),
+            options,
+        )
+
+        self.assertEqual(options.targets, "all")
+        self.assertIn("-DLLVM_TARGETS_TO_BUILD=all", command)
+
+    def test_native_target_remains_available_as_an_override(self) -> None:
+        options = BuildOptions(
+            revision=SourceRevision(RevisionKind.TAG, "22.1.8"),
+            install_prefix=Path("/install"),
+            host_toolchain=self._host(),
+            targets="Native",
+        )
+
+        command = _configure_command(
+            "cmake",
+            "ninja",
+            Path("/source/llvm"),
+            Path("/build"),
+            Path("/install"),
+            options,
+        )
+
+        self.assertIn("-DLLVM_TARGETS_TO_BUILD=Native", command)
+
+
 class BuilderStandardLibraryTests(unittest.TestCase):
     def test_managed_libcxx_is_added_to_the_runtimes_build(self) -> None:
         host = HostToolchain(

@@ -233,7 +233,7 @@ def _interactive_build(paths: ManagerPaths, repository_url: str) -> Path:
     cxx_standard_library = (
         _select_cxx_standard_library() if sys.platform == "darwin" else SYSTEM_CXX_STANDARD_LIBRARY
     )
-    targets = _prompt("LLVM targets to build [Native; enter 'all' for every backend]: ", default="Native")
+    targets = _prompt("LLVM targets to build [all; enter 'Native' for host-only]: ", default="all")
     jobs = int(_prompt(f"Parallel build jobs [{max(1, os.cpu_count() or 1)}]: ", default=str(max(1, os.cpu_count() or 1))))
     return build_and_install(
         paths,
@@ -393,7 +393,7 @@ def build_parser(default_root: Path | None = None) -> argparse.ArgumentParser:
         choices=CXX_STANDARD_LIBRARY_CHOICES,
         help="C++ standard library paired with this install (default: system)",
     )
-    build.add_argument("--targets", default="Native", help="LLVM targets, semicolon-separated, or 'all'")
+    build.add_argument("--targets", default="all", help="LLVM targets, semicolon-separated, or 'all' (default: all)")
     build.add_argument("--jobs", type=int, default=max(1, os.cpu_count() or 1))
     build.add_argument("--clean", action="store_true", help="Clean the build directory and manager-owned install before building")
     build.add_argument("--no-verify", action="store_true", help="Skip installed compiler link and execution checks")
