@@ -5,7 +5,14 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from llvm_mgr.builder import BuildOptions, _configure_command, _host_cmake_options, _llvm_major
+from llvm_mgr.builder import (
+    BuildOptions,
+    _configure_command,
+    _host_cmake_options,
+    _macos_managed_libcxx_configure_command,
+    _primary_build_runtimes,
+    _llvm_major,
+)
 from llvm_mgr.repository import RevisionKind, SourceRevision
 from llvm_mgr.standard_library import MANAGED_LIBCXX_STANDARD_LIBRARY
 from llvm_mgr.toolchains import HostToolchain
@@ -105,7 +112,7 @@ class BuilderTargetTests(unittest.TestCase):
 
 
 class BuilderStandardLibraryTests(unittest.TestCase):
-    def test_managed_libcxx_is_added_to_the_runtimes_build(self) -> None:
+    def test_macos_managed_libcxx_is_split_from_the_primary_runtime_build(self) -> None:
         host = HostToolchain(
             "clang",
             "Clang",
@@ -129,12 +136,27 @@ class BuilderStandardLibraryTests(unittest.TestCase):
                 options,
             )
 
-        self.assertIn(
-            "-DLLVM_ENABLE_RUNTIMES=compiler-rt;libcxx;libcxxabi;libunwind",
-            command,
-        )
-        self.assertIn("-DLIBCXXABI_USE_LLVM_UNWINDER=ON", command)
+        self.assertEqual(_primary_build_runtimes(options, "darwin"), ("compiler-rt",))
+        self.assertIn("-DLLVM_ENABLE_RUNTIMES=compiler-rt", command)
+        self.assertNotIn("-DLIBCXXABI_USE_LLVM_UNWINDER=ON", command)
         self.assertIn("-DCLANG_USE_XCSELECT=ON", command)
+
+    def test_macos_managed_libcxx_runtime_build_is_universal(self) -> None:
+        command = _macos_managed_libcxx_configure_command(
+            "cmake",
+            "ninja",
+            Path("/source/runtimes"),
+            Path("/build/managed-libcxx-universal"),
+            Path("/install"),
+            "Release",
+        )
+
+        self.assertIn("-DCMAKE_C_COMPILER=/install/bin/clang", command)
+        self.assertIn("-DCMAKE_CXX_COMPILER=/install/bin/clang++", command)
+        self.assertIn("-DCMAKE_CXX_FLAGS=--no-default-config", command)
+        self.assertIn("-DCMAKE_OSX_ARCHITECTURES=arm64;x86_64", command)
+        self.assertIn("-DLLVM_ENABLE_RUNTIMES=libcxx;libcxxabi;libunwind", command)
+        self.assertIn("-DLIBCXXABI_USE_LLVM_UNWINDER=ON", command)
 
 
 if __name__ == "__main__":

@@ -250,13 +250,25 @@ class BuildQualityTests(unittest.TestCase):
                 return None
 
             with patch("llvm_mgr.builder.run", side_effect=fake_run):
-                _verify_install(prefix, 22, {}, run_executables=True)
+                _verify_install(
+                    prefix,
+                    22,
+                    {},
+                    run_executables=True,
+                    cxx_architectures=("arm64", "x86_64"),
+                )
 
             compile_commands = [command for command in commands if "-o" in command]
-            self.assertEqual(len(compile_commands), 2)
+            self.assertEqual(len(compile_commands), 4)
             self.assertTrue(all("-c" not in command for command in compile_commands))
             self.assertTrue(any(command[0] == clang for command in commands))
             self.assertTrue(any(command[0] == clangxx for command in commands))
+            self.assertTrue(
+                any(command[0] == clangxx and command[1:4] == ["-std=c++20", "-arch", "arm64"] for command in commands)
+            )
+            self.assertTrue(
+                any(command[0] == clangxx and command[1:4] == ["-std=c++20", "-arch", "x86_64"] for command in commands)
+            )
 
 
 class ConfigQualityTests(unittest.TestCase):

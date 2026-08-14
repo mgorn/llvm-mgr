@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import struct
 from pathlib import Path
 from typing import Mapping
 
@@ -18,6 +19,7 @@ from .util import (
 
 SYSTEM_CXX_STANDARD_LIBRARY = "system"
 MANAGED_LIBCXX_STANDARD_LIBRARY = "managed-libc++"
+MACOS_MANAGED_LIBCXX_ARCHITECTURES = ("arm64", "x86_64")
 CXX_STANDARD_LIBRARY_CHOICES = (
     SYSTEM_CXX_STANDARD_LIBRARY,
     MANAGED_LIBCXX_STANDARD_LIBRARY,
@@ -66,6 +68,80 @@ def _has_libcxx_library(directory: Path) -> bool:
         return any(directory.glob("libc++.*"))
     except OSError:
         return False
+
+
+_MACHO_CPU_ARCHITECTURES = {
+    0x01000007: "x86_64",
+    0x0100000C: "arm64",
+}
+
+
+def _macho_architectures(path: Path) -> set[str]:
+    try:
+        with path.open("rb") as stream:
+            header = stream.read(4096)
+    except OSError as error:
+        raise LLVMManagerError(f"Could not inspect managed libc++ library: {path}") from error
+
+    if len(header) < 8:
+        raise LLVMManagerError(f"Managed libc++ library is not a valid Mach-O file: {path}")
+
+    fat_formats = {
+        b"\xca\xfe\xba\xbe": (">", 20),
+        b"\xbe\xba\xfe\xca": ("<", 20),
+        b"\xca\xfe\xba\xbf": (">", 32),
+        b"\xbf\xba\xfe\xca": ("<", 32),
+    }
+    fat = fat_formats.get(header[:4])
+    if fat is not None:
+        endian, record_size = fat
+        count = struct.unpack_from(f"{endian}I", header, 4)[0]
+        required = 8 + count * record_size
+        if count < 1 or required > len(header):
+            raise LLVMManagerError(f"Managed libc++ library has an invalid Mach-O fat header: {path}")
+        result: set[str] = set()
+        for index in range(count):
+            cpu_type = struct.unpack_from(f"{endian}I", header, 8 + index * record_size)[0]
+            architecture = _MACHO_CPU_ARCHITECTURES.get(cpu_type)
+            if architecture:
+                result.add(architecture)
+        return result
+
+    thin_formats = {
+        b"\xcf\xfa\xed\xfe": "<",
+        b"\xfe\xed\xfa\xcf": ">",
+        b"\xce\xfa\xed\xfe": "<",
+        b"\xfe\xed\xfa\xce": ">",
+    }
+    endian = thin_formats.get(header[:4])
+    if endian is None:
+        raise LLVMManagerError(f"Managed libc++ library is not a valid Mach-O file: {path}")
+    cpu_type = struct.unpack_from(f"{endian}I", header, 4)[0]
+    architecture = _MACHO_CPU_ARCHITECTURES.get(cpu_type)
+    return {architecture} if architecture else set()
+
+
+def _validate_managed_libcxx_architectures(
+    libraries: Path,
+    architectures: tuple[str, ...],
+) -> None:
+    if not architectures:
+        return
+    primary = libraries / "libc++.dylib"
+    candidates = [primary] if primary.is_file() else sorted(
+        path for path in libraries.glob("libc++*.dylib") if path.is_file()
+    )
+    if not candidates:
+        raise LLVMManagerError(f"Managed libc++ dynamic library was not found under {libraries}")
+    actual = _macho_architectures(candidates[0])
+    expected = {"arm64" if item == "aarch64" else item for item in architectures}
+    missing = sorted(expected - actual)
+    if missing:
+        raise LLVMManagerError(
+            "Managed libc++ is missing required macOS architecture slice(s): "
+            + ", ".join(missing)
+            + f" ({candidates[0]})"
+        )
 
 
 def _libcxx_header_directory(prefix: Path, triple: str) -> Path:
@@ -152,23 +228,31 @@ def managed_libcxx_from_metadata(metadata: Mapping[str, object]) -> dict[str, ob
         return None
     if not isinstance(selected.get("headers"), str) or not isinstance(selected.get("libraries"), str):
         return None
-    return {
+    capability: dict[str, object] = {
         "kind": MANAGED_LIBCXX_STANDARD_LIBRARY,
         "target": selected.get("provider_target", selected.get("target")),
         "headers": selected["headers"],
         "libraries": selected["libraries"],
         "runtimes": list(selected.get("runtimes", _MANAGED_LIBCXX_RUNTIMES)),
     }
+    architectures = selected.get("architectures")
+    if isinstance(architectures, list) and all(isinstance(item, str) for item in architectures):
+        capability["architectures"] = list(architectures)
+    return capability
 
 
 def managed_libcxx_capability(selection: Mapping[str, object]) -> dict[str, object]:
-    return {
+    capability: dict[str, object] = {
         "kind": MANAGED_LIBCXX_STANDARD_LIBRARY,
         "target": selection.get("provider_target", selection.get("target")),
         "headers": selection["headers"],
         "libraries": selection["libraries"],
         "runtimes": list(selection.get("runtimes", _MANAGED_LIBCXX_RUNTIMES)),
     }
+    architectures = selection.get("architectures")
+    if isinstance(architectures, list) and all(isinstance(item, str) for item in architectures):
+        capability["architectures"] = list(architectures)
+    return capability
 
 
 def _provider_paths(
@@ -181,19 +265,34 @@ def _provider_paths(
         raise LLVMManagerError(f"Managed libc++ headers are missing: {headers}")
     if not libraries.is_dir() or not _has_libcxx_library(libraries):
         raise LLVMManagerError(f"Managed libc++ libraries are missing: {libraries}")
+    architectures_value = capability.get("architectures")
+    architectures = (
+        tuple(item for item in architectures_value if isinstance(item, str))
+        if isinstance(architectures_value, list)
+        else ()
+    )
+    _validate_managed_libcxx_architectures(libraries, architectures)
     return headers, libraries
 
 
-def _local_managed_libcxx_capability(prefix: Path, triple: str) -> dict[str, object]:
+def _local_managed_libcxx_capability(
+    prefix: Path,
+    triple: str,
+    architectures: tuple[str, ...] = (),
+) -> dict[str, object]:
     headers = _libcxx_header_directory(prefix, triple)
     libraries = _libcxx_library_directory(prefix)
-    return {
+    _validate_managed_libcxx_architectures(libraries, architectures)
+    capability: dict[str, object] = {
         "kind": MANAGED_LIBCXX_STANDARD_LIBRARY,
         "target": triple,
         "headers": str(headers.relative_to(prefix)),
         "libraries": str(libraries.relative_to(prefix)),
         "runtimes": list(_MANAGED_LIBCXX_RUNTIMES),
     }
+    if architectures:
+        capability["architectures"] = list(architectures)
+    return capability
 
 
 def _write_managed_libcxx_config(
@@ -240,19 +339,112 @@ def _write_managed_libcxx_config(
     return selection, config
 
 
+def _triple_architecture(triple: str) -> str:
+    return triple.split("-", 1)[0]
+
+
+def _same_architecture(left: str, right: str) -> bool:
+    aliases = ({"arm64", "aarch64"}, {"x86_64", "amd64"})
+    if left == right:
+        return True
+    return any(left in group and right in group for group in aliases)
+
+
+def _target_triple_for_arch(
+    clangxx: Path,
+    env: Mapping[str, str],
+    architecture: str,
+    native_triple: str,
+) -> str:
+    if _same_architecture(_triple_architecture(native_triple), architecture):
+        return native_triple
+    completed = run(
+        [clangxx, "-arch", architecture, "--print-target-triple"],
+        capture=True,
+        check=False,
+        env=env,
+    )
+    output = completed.stdout.strip()
+    triple = output.splitlines()[0] if output else ""
+    if completed.returncode == 0 and triple and _TARGET_TRIPLE_RE.fullmatch(triple):
+        return triple
+    _, separator, suffix = native_triple.partition("-")
+    if separator:
+        fallback = f"{architecture}-{suffix}"
+        if _TARGET_TRIPLE_RE.fullmatch(fallback):
+            return fallback
+    raise LLVMManagerError(
+        f"Could not determine the {architecture} target triple for installed compiler: {clangxx}"
+    )
+
+
+def _write_managed_libcxx_configs(
+    compiler_prefix: Path,
+    major: int,
+    env: Mapping[str, str],
+    provider_prefix: Path,
+    capability: Mapping[str, object],
+    *,
+    provider_version: str | None = None,
+    provider_tag: str | None = None,
+    compiler_target: str | None = None,
+) -> tuple[dict[str, object], list[Path]]:
+    suffix = ".exe" if os.name == "nt" else ""
+    clangxx = compiler_prefix / "bin" / f"clang++-{major}{suffix}"
+    native_triple = compiler_target or _target_triple(clangxx, env)
+    targets = [native_triple]
+    architectures_value = capability.get("architectures")
+    architectures = (
+        tuple(item for item in architectures_value if isinstance(item, str))
+        if isinstance(architectures_value, list)
+        else ()
+    )
+    for architecture in architectures:
+        target = _target_triple_for_arch(clangxx, env, architecture, native_triple)
+        if target not in targets:
+            targets.append(target)
+
+    selected: dict[str, object] | None = None
+    configs: list[Path] = []
+    for target in targets:
+        configured, config = _write_managed_libcxx_config(
+            compiler_prefix,
+            major,
+            env,
+            provider_prefix,
+            capability,
+            provider_version=provider_version,
+            provider_tag=provider_tag,
+            compiler_target=target,
+        )
+        if target == native_triple:
+            selected = configured
+        configs.append(config)
+
+    if selected is None:
+        raise LLVMManagerError("Managed libc++ configuration did not include the compiler's native target")
+    selected["targets"] = targets
+    selected["configs"] = [str(path.relative_to(compiler_prefix)) for path in configs]
+    if architectures:
+        selected["architectures"] = list(architectures)
+    return selected, configs
+
+
 def configure_standard_library(
     prefix: Path,
     major: int,
     env: Mapping[str, str],
     selection: str,
+    *,
+    architectures: tuple[str, ...] = (),
 ) -> tuple[dict[str, object], list[Path]]:
     if selection == SYSTEM_CXX_STANDARD_LIBRARY:
         return {"kind": SYSTEM_CXX_STANDARD_LIBRARY}, []
     if selection == MANAGED_LIBCXX_STANDARD_LIBRARY:
         suffix = ".exe" if os.name == "nt" else ""
         triple = _target_triple(prefix / "bin" / f"clang++-{major}{suffix}", env)
-        capability = _local_managed_libcxx_capability(prefix, triple)
-        configured, config = _write_managed_libcxx_config(
+        capability = _local_managed_libcxx_capability(prefix, triple, architectures)
+        configured, configs = _write_managed_libcxx_configs(
             prefix,
             major,
             env,
@@ -260,7 +452,7 @@ def configure_standard_library(
             capability,
             compiler_target=triple,
         )
-        return configured, [config]
+        return configured, configs
     raise LLVMManagerError(f"Unsupported C++ standard library selection: {selection}")
 
 
@@ -278,6 +470,30 @@ def _selected_config(prefix: Path, metadata: Mapping[str, object]) -> Path | Non
     except ValueError:
         return None
     return candidate
+
+
+def _selected_configs(prefix: Path, metadata: Mapping[str, object]) -> list[Path]:
+    selected = metadata.get("cxx_standard_library")
+    if not isinstance(selected, dict) or selected.get("kind") != MANAGED_LIBCXX_STANDARD_LIBRARY:
+        return []
+    values = selected.get("configs")
+    if not isinstance(values, list):
+        config = _selected_config(prefix, metadata)
+        return [config] if config is not None else []
+
+    root = prefix.resolve()
+    result: list[Path] = []
+    for value in values:
+        if not isinstance(value, str) or not value:
+            continue
+        candidate = (root / value).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            continue
+        if candidate not in result:
+            result.append(candidate)
+    return result
 
 
 def _is_manager_config(path: Path) -> bool:
@@ -323,13 +539,12 @@ def switch_standard_library(
         metadata = dict(metadata_value)
 
         local_capability = managed_libcxx_from_metadata(metadata)
-        previous_config = _selected_config(compiler_prefix, metadata)
-        previous_config_text = (
-            previous_config.read_text(encoding="utf-8")
-            if previous_config is not None and previous_config.is_file()
-            else None
-        )
-        new_config: Path | None = None
+        previous_configs = _selected_configs(compiler_prefix, metadata)
+        previous_config_texts = {
+            config: config.read_text(encoding="utf-8") if config.is_file() else None
+            for config in previous_configs
+        }
+        new_configs: list[Path] = []
 
         state_existed = paths.state_file.is_file()
         original_state_text = paths.state_file.read_text(encoding="utf-8") if state_existed else None
@@ -337,8 +552,9 @@ def switch_standard_library(
         try:
             if provider is None:
                 selected: dict[str, object] = {"kind": SYSTEM_CXX_STANDARD_LIBRARY}
-                if previous_config is not None and _is_manager_config(previous_config):
-                    previous_config.unlink()
+                for previous_config in previous_configs:
+                    if _is_manager_config(previous_config):
+                        previous_config.unlink()
             else:
                 if not provider.managed:
                     raise LLVMManagerError("The selected libc++ provider is not managed by llvm-manager")
@@ -354,7 +570,7 @@ def switch_standard_library(
                 capability = managed_libcxx_from_metadata(provider_metadata_value)
                 if capability is None:
                     raise LLVMManagerError(f"{provider.label} does not contain a managed libc++ installation")
-                selected, new_config = _write_managed_libcxx_config(
+                selected, new_configs = _write_managed_libcxx_configs(
                     compiler_prefix,
                     compiler.version.major,
                     environment,
@@ -363,12 +579,9 @@ def switch_standard_library(
                     provider_version=provider.version.display if provider.version else None,
                     provider_tag=provider.tag,
                 )
-                if (
-                    previous_config is not None
-                    and previous_config != new_config
-                    and _is_manager_config(previous_config)
-                ):
-                    previous_config.unlink()
+                for previous_config in previous_configs:
+                    if previous_config not in new_configs and _is_manager_config(previous_config):
+                        previous_config.unlink()
 
             if local_capability is not None:
                 metadata["managed_cxx_standard_library"] = local_capability
@@ -380,12 +593,12 @@ def switch_standard_library(
             installed_files = {
                 item for item in installed if isinstance(item, str)
             } if isinstance(installed, list) else set()
-            if previous_config is not None:
+            for previous_config in previous_configs:
                 try:
                     installed_files.discard(str(previous_config.relative_to(compiler_prefix)))
                 except ValueError:
                     pass
-            if new_config is not None:
+            for new_config in new_configs:
                 installed_files.add(str(new_config.relative_to(compiler_prefix)))
             metadata["installed_files"] = sorted(installed_files)
             write_json(metadata_path, metadata)
@@ -405,12 +618,11 @@ def switch_standard_library(
                 write_json(paths.state_file, state)
         except Exception:
             atomic_write_text(metadata_path, original_metadata_text)
-            if previous_config is not None:
-                _restore_file(previous_config, previous_config_text)
-            if new_config is not None and new_config != previous_config:
-                _restore_file(new_config, None)
-            elif new_config is not None and previous_config_text is None:
-                _restore_file(new_config, None)
+            for previous_config, contents in previous_config_texts.items():
+                _restore_file(previous_config, contents)
+            for new_config in new_configs:
+                if new_config not in previous_config_texts:
+                    _restore_file(new_config, None)
             if state_existed and original_state_text is not None:
                 atomic_write_text(paths.state_file, original_state_text)
             elif paths.state_file.exists():

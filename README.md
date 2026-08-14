@@ -118,12 +118,14 @@ llvm-manager build 22.1.8 --stdlib managed-libc++
 
 When the currently selected LLVM installation is manager-owned, the main menu also includes **Switch C++ standard library**. It lists the platform/Xcode SDK library and every libc++ version available from manager-owned LLVM installations. Selecting one rewrites only the active compiler's target-specific configuration; it does not rebuild, move, or modify the provider installation. Switching back to the platform library removes the pairing configuration but keeps any locally built libc++ available for later reuse.
 
-A managed libc++ is installed inside the LLVM prefix rather than replacing anything in Xcode or the operating system. LLVM Manager adds `libcxx`, `libcxxabi`, and `libunwind` to `LLVM_ENABLE_RUNTIMES`, so CMake builds them with the just-built Clang as part of the toolchain build. It then creates a relocatable, target-specific Clang configuration in the selected compiler's `bin` directory. Normal use of that installation's `clang++` therefore:
+A managed libc++ is installed inside the LLVM prefix rather than replacing anything in Xcode or the operating system. LLVM Manager builds `libcxx`, `libcxxabi`, and `libunwind` with the just-built Clang. On macOS, those runtimes are built in a dedicated second CMake phase with `CMAKE_OSX_ARCHITECTURES=arm64;x86_64`, producing a Universal 2 runtime usable by both Apple Silicon and Intel targets without making every LLVM executable itself universal. On other supported POSIX hosts, the managed runtime stack remains part of `LLVM_ENABLE_RUNTIMES` in the main toolchain build.
+
+LLVM Manager then creates relocatable, target-specific Clang configurations in the selected compiler's `bin` directory. A Universal 2 macOS runtime gets configurations for both the `arm64` and `x86_64` Darwin target triples. Normal use of that installation's `clang++` therefore:
 
 - ignores the SDK's C++ headers while continuing to use the SDK for C headers, frameworks, and platform libraries;
 - uses the paired `include/c++/v1` headers and libc++ libraries;
 - embeds the paired library directory as a runtime search path; and
-- avoids applying the host libc++ automatically when an explicit different target is selected.
+- applies the managed libc++ automatically for each runtime architecture that was actually built, while leaving unrelated targets such as WebAssembly unpaired.
 
 Pass Clang's `--no-default-config` option to bypass the pairing for an individual invocation. Managed libc++ pairing is currently available on POSIX hosts and is intentionally rejected on Windows.
 
@@ -139,7 +141,8 @@ After installation, LLVM Manager:
 2. Runs `clang-<major> --version`.
 3. Compiles and links a C executable.
 4. Compiles and links a C++20 executable that includes `<concepts>`, using the paired libc++ configuration when selected.
-5. Runs both executables when the target selection guarantees the host backend (`all`, `Native`, or `host`).
+5. For a managed libc++ build on macOS, validates that the installed `libc++.dylib` contains both `arm64` and `x86_64` Mach-O slices, then separately compiles and links that C++20 program for both architectures.
+6. Runs the native C and C++ executables when the target selection guarantees the host backend (`all`, `Native`, or `host`).
 
 Use `--no-verify` only when the target cannot run on the host or verification must be handled separately.
 

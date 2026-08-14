@@ -14,6 +14,7 @@ from .aliases import ensure_versioned_binaries
 from .config import ManagerPaths
 from .repository import DEFAULT_REPOSITORY_URL, LLVMRepository, SourceRevision
 from .standard_library import (
+    MACOS_MANAGED_LIBCXX_ARCHITECTURES,
     MANAGED_LIBCXX_STANDARD_LIBRARY,
     SYSTEM_CXX_STANDARD_LIBRARY,
     configure_standard_library,
@@ -51,6 +52,14 @@ def _cmake_list(values: tuple[str, ...]) -> str:
 
 def _effective_runtimes(options: BuildOptions) -> tuple[str, ...]:
     return standard_library_runtimes(options.cxx_standard_library, options.runtimes)
+
+
+def _primary_build_runtimes(options: BuildOptions, platform: str) -> tuple[str, ...]:
+    runtimes = _effective_runtimes(options)
+    if platform != "darwin" or options.cxx_standard_library != MANAGED_LIBCXX_STANDARD_LIBRARY:
+        return runtimes
+    managed = set(standard_library_runtimes(MANAGED_LIBCXX_STANDARD_LIBRARY, ()))
+    return tuple(runtime for runtime in runtimes if runtime not in managed)
 
 
 def _host_cmake_options(platform: str) -> tuple[str, ...]:
@@ -204,13 +213,99 @@ def _configure_command(
         "-DLLVM_INCLUDE_BENCHMARKS=OFF",
     ]
     command.extend(_host_cmake_options(sys.platform))
-    runtimes = _effective_runtimes(options)
+    runtimes = _primary_build_runtimes(options, sys.platform)
     if runtimes:
         command.append(f"-DLLVM_ENABLE_RUNTIMES={_cmake_list(runtimes)}")
-    command.extend(standard_library_cmake_options(options.cxx_standard_library))
+    if sys.platform != "darwin" or options.cxx_standard_library != MANAGED_LIBCXX_STANDARD_LIBRARY:
+        command.extend(standard_library_cmake_options(options.cxx_standard_library))
     if options.targets:
         command.append(f"-DLLVM_TARGETS_TO_BUILD={options.targets}")
     return command
+
+
+def _macos_managed_libcxx_configure_command(
+    cmake: str,
+    ninja: str,
+    runtimes_source: Path,
+    build_dir: Path,
+    install_prefix: Path,
+    build_type: str,
+) -> list[str | Path]:
+    clang = install_prefix / "bin" / "clang"
+    clangxx = install_prefix / "bin" / "clang++"
+    return [
+        cmake,
+        "-S",
+        runtimes_source,
+        "-B",
+        build_dir,
+        "-G",
+        "Ninja",
+        f"-DCMAKE_MAKE_PROGRAM={ninja}",
+        f"-DCMAKE_BUILD_TYPE={build_type}",
+        f"-DCMAKE_INSTALL_PREFIX={install_prefix}",
+        f"-DCMAKE_C_COMPILER={clang}",
+        f"-DCMAKE_CXX_COMPILER={clangxx}",
+        f"-DCMAKE_ASM_COMPILER={clang}",
+        "-DCMAKE_C_FLAGS=--no-default-config",
+        "-DCMAKE_CXX_FLAGS=--no-default-config",
+        "-DCMAKE_ASM_FLAGS=--no-default-config",
+        f"-DCMAKE_OSX_ARCHITECTURES={_cmake_list(MACOS_MANAGED_LIBCXX_ARCHITECTURES)}",
+        "-DLLVM_ENABLE_RUNTIMES=libcxx;libcxxabi;libunwind",
+        "-DLIBCXXABI_USE_LLVM_UNWINDER=ON",
+        "-DLLVM_INCLUDE_TESTS=OFF",
+        "-DLIBCXX_INCLUDE_TESTS=OFF",
+        "-DLIBCXXABI_INCLUDE_TESTS=OFF",
+        "-DLIBUNWIND_INCLUDE_TESTS=OFF",
+    ]
+
+
+def _build_macos_managed_libcxx(
+    cmake: str,
+    ninja: str,
+    llvm_source: Path,
+    build_dir: Path,
+    install_prefix: Path,
+    options: BuildOptions,
+    env: dict[str, str],
+) -> Path | None:
+    if sys.platform != "darwin" or options.cxx_standard_library != MANAGED_LIBCXX_STANDARD_LIBRARY:
+        return None
+    runtimes_source = llvm_source.parent / "runtimes"
+    if not (runtimes_source / "CMakeLists.txt").is_file():
+        raise LLVMManagerError(f"Selected source revision has no runtimes CMake project: {runtimes_source}")
+    clang = install_prefix / "bin" / "clang"
+    clangxx = install_prefix / "bin" / "clang++"
+    if not clang.is_file() or not clangxx.is_file():
+        raise LLVMManagerError(
+            "The just-built Clang installation is required before building the universal managed libc++ runtime"
+        )
+
+    runtime_build_dir = build_dir / "managed-libcxx-universal"
+    run(
+        _macos_managed_libcxx_configure_command(
+            cmake,
+            ninja,
+            runtimes_source,
+            runtime_build_dir,
+            install_prefix,
+            options.build_type,
+        ),
+        env=env,
+    )
+    run(
+        [
+            cmake,
+            "--build",
+            runtime_build_dir,
+            "--target",
+            "install",
+            "--parallel",
+            str(options.jobs),
+        ],
+        env=env,
+    )
+    return runtime_build_dir
 
 
 def _verify_install(
@@ -219,6 +314,7 @@ def _verify_install(
     env: dict[str, str],
     *,
     run_executables: bool,
+    cxx_architectures: tuple[str, ...] = (),
 ) -> None:
     suffix = ".exe" if os.name == "nt" else ""
     clang = prefix / "bin" / f"clang-{major}{suffix}"
@@ -256,18 +352,32 @@ def _verify_install(
             if run_executables:
                 run([output], env=env)
 
+        for architecture in cxx_architectures:
+            source = directory / f"verify-cxx-{architecture}.cxx"
+            output = directory / f"verify-cxx-{architecture}{executable_suffix}"
+            source.write_text(
+                "#include <concepts>\nstatic_assert(std::same_as<int, int>);\nint main() { return 0; }\n",
+                encoding="utf-8",
+            )
+            run([clangxx, "-std=c++20", "-arch", architecture, source, "-o", output], env=env)
+            if not output.is_file():
+                raise LLVMManagerError(
+                    f"Compiler verification produced no {architecture} C++ executable: {output}"
+                )
+
 
 def _installed_files(
-    build_dir: Path,
+    build_dirs: tuple[Path, ...],
     prefix: Path,
     manager_files: list[Path],
 ) -> list[str]:
     paths = [*manager_files, prefix / ".llvm-manager.json"]
-    manifest = build_dir / "install_manifest.txt"
-    if manifest.is_file():
-        for line in manifest.read_text(encoding="utf-8").splitlines():
-            if line.strip():
-                paths.append(Path(line.strip()))
+    for build_dir in build_dirs:
+        manifest = build_dir / "install_manifest.txt"
+        if manifest.is_file():
+            for line in manifest.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    paths.append(Path(line.strip()))
 
     result: set[str] = set()
     for path in paths:
@@ -329,12 +439,27 @@ def build_and_install(paths: ManagerPaths, options: BuildOptions) -> Path:
             env=build_env,
         )
 
+        managed_runtime_build_dir = _build_macos_managed_libcxx(
+            tools["cmake"],
+            tools["ninja"],
+            llvm_source,
+            build_dir,
+            install_prefix,
+            options,
+            build_env,
+        )
         created_aliases = ensure_versioned_binaries(install_prefix, major)
+        managed_architectures = (
+            MACOS_MANAGED_LIBCXX_ARCHITECTURES
+            if sys.platform == "darwin" and options.cxx_standard_library == MANAGED_LIBCXX_STANDARD_LIBRARY
+            else ()
+        )
         standard_library, standard_library_files = configure_standard_library(
             install_prefix,
             major,
             build_env,
             options.cxx_standard_library,
+            architectures=managed_architectures,
         )
         manager_files = [*created_aliases, *standard_library_files]
         if options.verify:
@@ -343,6 +468,7 @@ def build_and_install(paths: ManagerPaths, options: BuildOptions) -> Path:
                 major,
                 build_env,
                 run_executables=options.targets.strip().lower() in {"all", "host", "native"},
+                cxx_architectures=managed_architectures,
             )
 
         metadata = {
@@ -361,6 +487,9 @@ def build_and_install(paths: ManagerPaths, options: BuildOptions) -> Path:
         }
         if standard_library.get("kind") == MANAGED_LIBCXX_STANDARD_LIBRARY:
             metadata["managed_cxx_standard_library"] = managed_libcxx_capability(standard_library)
-        metadata["installed_files"] = _installed_files(build_dir, install_prefix, manager_files)
+        install_build_dirs = (build_dir,) + (
+            (managed_runtime_build_dir,) if managed_runtime_build_dir is not None else ()
+        )
+        metadata["installed_files"] = _installed_files(install_build_dirs, install_prefix, manager_files)
         write_json(install_prefix / ".llvm-manager.json", metadata)
         return install_prefix
