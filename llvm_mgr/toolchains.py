@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import platform
 import re
@@ -11,6 +10,7 @@ from pathlib import Path
 from typing import Iterable, Mapping
 
 from .util import LLVMManagerError, extract_numeric_version, probe_process, probe_text, shutil_which
+from .windows import augment_windows_search_path, visual_studio_installations
 
 _SAFE_ID_RE = re.compile(r"[^a-z0-9]+")
 _COMPILER_EXECUTABLE_RE = re.compile(
@@ -83,16 +83,14 @@ def _compiler_usable(
             ]
 
         compiler_environment = dict(env) if env is not None else None
-        for command in commands:
+        for command, output in zip(commands, (c_output, cxx_output), strict=True):
             completed = probe_process(command, cwd=root, env=compiler_environment, timeout=30)
             if completed is None or completed.returncode != 0:
-                return False
-
-        for output in (c_output, cxx_output):
-            if not output.is_file():
-                return False
-            completed = probe_process([output], cwd=root, env=compiler_environment, timeout=10)
-            if completed is None or completed.returncode != 0:
+                # Compiler startup can occasionally be delayed by antivirus or other
+                # Windows process hooks. Retry one failed probe before treating the
+                # installed toolchain as unusable.
+                completed = probe_process(command, cwd=root, env=compiler_environment, timeout=30)
+            if completed is None or completed.returncode != 0 or not output.is_file():
                 return False
         return True
 
@@ -245,17 +243,6 @@ def _path_toolchains(search_path: str) -> list[HostToolchain]:
     return toolchains
 
 
-def _find_vswhere() -> Path | None:
-    found = shutil_which("vswhere.exe") or shutil_which("vswhere")
-    if found:
-        return Path(found).resolve()
-    program_files = os.environ.get("ProgramFiles(x86)") or os.environ.get("ProgramFiles")
-    if not program_files:
-        return None
-    candidate = Path(program_files) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
-    return candidate if candidate.is_file() else None
-
-
 def _msvc_architecture() -> str:
     machine = platform.machine().lower()
     if machine in {"arm64", "aarch64"}:
@@ -284,35 +271,11 @@ def _load_batch_environment(script: Path, arguments: tuple[str, ...]) -> dict[st
 def _visual_studio_toolchains() -> list[HostToolchain]:
     if os.name != "nt":
         return []
-    vswhere = _find_vswhere()
-    if vswhere is None:
-        return []
-    completed = probe_process(
-        [
-            vswhere,
-            "-all",
-            "-products",
-            "*",
-            "-requires",
-            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
-            "-format",
-            "json",
-            "-utf8",
-        ],
-        timeout=20,
-    )
-    if completed is None or completed.returncode != 0:
-        return []
-    try:
-        instances = json.loads(completed.stdout)
-    except json.JSONDecodeError:
-        return []
-
 
     results: list[HostToolchain] = []
     architecture = _msvc_architecture()
-    for instance in instances:
-        root = Path(instance.get("installationPath", ""))
+    for instance in visual_studio_installations():
+        root = instance.path
         script = root / "VC" / "Auxiliary" / "Build" / "vcvarsall.bat"
         if not script.is_file():
             continue
@@ -328,14 +291,12 @@ def _visual_studio_toolchains() -> list[HostToolchain]:
         _, compiler_version, _ = _compiler_description(compiler_path, environment)
         if not _compiler_usable(compiler_path, compiler_path, "msvc", environment):
             continue
-        display_name = instance.get("displayName") or "Visual Studio MSVC"
-        installation_version = instance.get("installationVersion")
-        version = compiler_version or installation_version
-        identifier = _safe_identifier(f"msvc-{installation_version or version or root.name}")
+        version = compiler_version or instance.version
+        identifier = _safe_identifier(f"msvc-{instance.version or version or root.name}")
         results.append(
             HostToolchain(
                 identifier=identifier,
-                name=display_name,
+                name=instance.display_name,
                 family="msvc",
                 cc=compiler_path,
                 cxx=compiler_path,
@@ -382,7 +343,7 @@ def _xcrun_toolchains() -> list[HostToolchain]:
 
 
 def discover_host_toolchains(search_path: str | None = None) -> list[HostToolchain]:
-    path_value = search_path if search_path is not None else os.environ.get("PATH", "")
+    path_value = augment_windows_search_path(search_path)
     platform_toolchains: list[HostToolchain] = []
     if search_path is None:
         platform_toolchains = _visual_studio_toolchains() + _xcrun_toolchains()
