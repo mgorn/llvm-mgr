@@ -93,6 +93,7 @@ class CLIQualityTests(unittest.TestCase):
     def test_build_defaults_to_all_llvm_targets(self) -> None:
         arguments = build_parser().parse_args(["build", "22.1.8"])
         self.assertEqual(arguments.targets, "all")
+        self.assertEqual(arguments.tools, "all")
 
     def test_invalid_revision_is_rejected_before_dependency_probe(self) -> None:
         errors = io.StringIO()

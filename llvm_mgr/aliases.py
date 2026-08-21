@@ -84,3 +84,28 @@ def ensure_versioned_binaries(install_prefix: Path, major: int) -> list[Path]:
     if not any(path.exists() and _is_executable(path) for path in clang_aliases):
         raise LLVMManagerError(f"Failed to create clang-{major} in {bin_dir}")
     return created
+
+
+def ensure_windows_mt_alias(install_prefix: Path, *, windows: bool | None = None) -> list[Path]:
+    if windows is None:
+        windows = os.name == "nt"
+    if not windows:
+        return []
+
+    bin_dir = install_prefix / "bin"
+    llvm_mt = bin_dir / "llvm-mt.exe"
+    if not llvm_mt.is_file():
+        raise LLVMManagerError(f"Installed LLVM manifest tool was not found: {llvm_mt}")
+
+    mt = bin_dir / "mt.exe"
+    if mt.exists() or mt.is_symlink():
+        if _alias_matches(mt, llvm_mt):
+            return []
+        if mt.is_dir() and not mt.is_symlink():
+            raise LLVMManagerError(f"Cannot replace manifest-tool alias directory: {mt}")
+        mt.unlink()
+
+    _create_alias(llvm_mt, mt)
+    if not _alias_matches(mt, llvm_mt):
+        raise LLVMManagerError(f"Failed to create a valid alias from {mt} to {llvm_mt}")
+    return [mt]

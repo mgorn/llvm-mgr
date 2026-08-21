@@ -7,10 +7,26 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from llvm_mgr.cli import _menu
+from llvm_mgr.cli import _menu, _select_llvm_tools
 from llvm_mgr.config import ManagerPaths
 from llvm_mgr.models import InstallInfo
 from llvm_mgr.versioning import LLVMVersion
+
+
+class BuildToolMenuTests(unittest.TestCase):
+    def test_defaults_to_all_llvm_tools(self) -> None:
+        with (
+            patch("llvm_mgr.cli._prompt", return_value="all"),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(_select_llvm_tools(), ("all",))
+
+    def test_accepts_a_comma_separated_tool_subset(self) -> None:
+        with (
+            patch("llvm_mgr.cli._prompt", return_value="lld,llvm-objdump,llvm-mt"),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(_select_llvm_tools(), ("lld", "llvm-objdump", "llvm-mt"))
 
 
 class MainMenuStandardLibraryTests(unittest.TestCase):
