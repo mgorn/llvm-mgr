@@ -7,10 +7,16 @@ from unittest.mock import patch
 
 from llvm_mgr.builder import (
     BuildOptions,
+    WindowsLibXml2,
     _configure_command,
+    _distribution_components,
     _host_cmake_options,
+    _install_targets,
     _macos_managed_libcxx_configure_command,
+    _normalized_tools,
     _primary_build_runtimes,
+    _tool_selection_requires_libxml2,
+    _verification_tools,
     _llvm_major,
 )
 from llvm_mgr.repository import RevisionKind, SourceRevision
@@ -109,6 +115,95 @@ class BuilderTargetTests(unittest.TestCase):
         )
 
         self.assertIn("-DLLVM_TARGETS_TO_BUILD=Native", command)
+
+
+class BuilderToolSelectionTests(unittest.TestCase):
+    def _host(self) -> HostToolchain:
+        return HostToolchain(
+            "clang",
+            "Clang",
+            "clang",
+            Path("/host/clang"),
+            Path("/host/clang++"),
+        )
+
+    def _options(self, tools: tuple[str, ...] = ("all",)) -> BuildOptions:
+        return BuildOptions(
+            revision=SourceRevision(RevisionKind.TAG, "22.1.8"),
+            install_prefix=Path("/install"),
+            host_toolchain=self._host(),
+            tools=tools,
+        )
+
+    def test_default_build_installs_all_configured_tools(self) -> None:
+        options = self._options()
+        command = _configure_command(
+            "cmake",
+            "ninja",
+            Path("/source/llvm"),
+            Path("/build"),
+            Path("/install"),
+            options,
+        )
+
+        self.assertEqual(_normalized_tools(options.tools), ("all",))
+        self.assertEqual(_distribution_components(options), ())
+        self.assertEqual(_install_targets(options, "linux"), ("install",))
+        self.assertFalse(any(str(argument).startswith("-DLLVM_DISTRIBUTION_COMPONENTS=") for argument in command))
+
+    def test_custom_tool_selection_keeps_clang_and_runtime_install(self) -> None:
+        options = self._options(("lld", "llvm-objdump"))
+        command = _configure_command(
+            "cmake",
+            "ninja",
+            Path("/source/llvm"),
+            Path("/build"),
+            Path("/install"),
+            options,
+        )
+
+        self.assertEqual(_normalized_tools(options.tools), ("clang", "lld", "llvm-objdump"))
+        self.assertEqual(
+            _distribution_components(options),
+            ("clang", "clang-resource-headers", "lld", "llvm-objdump"),
+        )
+        self.assertEqual(_install_targets(options, "linux"), ("install-distribution", "install-runtimes"))
+        self.assertIn(
+            "-DLLVM_DISTRIBUTION_COMPONENTS=clang;clang-resource-headers;lld;llvm-objdump",
+            command,
+        )
+
+    def test_mt_alias_normalizes_to_llvm_mt(self) -> None:
+        self.assertEqual(_normalized_tools(("mt",)), ("clang", "llvm-mt"))
+
+    def test_all_cannot_be_combined_with_individual_tools(self) -> None:
+        with self.assertRaisesRegex(LLVMManagerError, "cannot be combined"):
+            _normalized_tools(("all", "llvm-ar"))
+
+    def test_windows_all_tools_forces_managed_libxml2_for_llvm_mt(self) -> None:
+        options = self._options()
+        libxml2 = WindowsLibXml2(Path("C:/libxml/include/libxml2"), Path("C:/libxml/lib/libxml2s.lib"))
+        with patch("llvm_mgr.builder.sys.platform", "win32"):
+            command = _configure_command(
+                "cmake",
+                "ninja",
+                Path("C:/source/llvm"),
+                Path("C:/build"),
+                Path("C:/install"),
+                options,
+                libxml2,
+            )
+
+        self.assertTrue(_tool_selection_requires_libxml2(options, "win32"))
+        self.assertIn("-DLLVM_ENABLE_LIBXML2=FORCE_ON", command)
+        self.assertIn("-DLIBXML2_INCLUDE_DIR=C:/libxml/include/libxml2", command)
+        self.assertIn("-DLIBXML2_LIBRARIES=C:/libxml/lib/libxml2s.lib", command)
+        self.assertEqual(_verification_tools(options, "win32"), ("llvm-mt", "mt"))
+
+    def test_windows_subset_without_llvm_mt_does_not_require_libxml2(self) -> None:
+        options = self._options(("llvm-objdump",))
+        self.assertFalse(_tool_selection_requires_libxml2(options, "win32"))
+        self.assertEqual(_verification_tools(options, "win32"), ("clang", "llvm-objdump"))
 
 
 class BuilderStandardLibraryTests(unittest.TestCase):
