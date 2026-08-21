@@ -17,6 +17,7 @@ from llvm_mgr.builder import (
     _primary_build_runtimes,
     _tool_selection_requires_libxml2,
     _verification_tools,
+    _windows_libxml2_toolchain,
     _llvm_major,
 )
 from llvm_mgr.repository import RevisionKind, SourceRevision
@@ -204,6 +205,69 @@ class BuilderToolSelectionTests(unittest.TestCase):
         options = self._options(("llvm-objdump",))
         self.assertFalse(_tool_selection_requires_libxml2(options, "win32"))
         self.assertEqual(_verification_tools(options, "win32"), ("clang", "llvm-objdump"))
+
+    def test_windows_libxml2_reuses_msvc_style_host_toolchain(self) -> None:
+        host = HostToolchain(
+            "clang-cl-24",
+            "ClangCL",
+            "clang-cl",
+            Path("C:/LLVM/clang-cl.exe"),
+            Path("C:/LLVM/clang-cl.exe"),
+            version="24.0.0",
+        )
+        with patch("llvm_mgr.builder.discover_host_toolchains") as discover:
+            selected = _windows_libxml2_toolchain(host)
+
+        self.assertIs(selected, host)
+        discover.assert_not_called()
+
+    def test_windows_libxml2_uses_msvc_compatible_compiler_for_gnu_clang(self) -> None:
+        host = HostToolchain(
+            "clang-23",
+            "Clang",
+            "clang",
+            Path("C:/LLVM/clang-23.exe"),
+            Path("C:/LLVM/clang++-23.exe"),
+            version="23.0.0",
+        )
+        sibling_clang_cl = HostToolchain(
+            "clang-cl-24",
+            "ClangCL",
+            "clang-cl",
+            Path("C:/LLVM/clang-cl.exe"),
+            Path("C:/LLVM/clang-cl.exe"),
+            version="24.0.0",
+        )
+        msvc = HostToolchain(
+            "msvc-19",
+            "MSVC",
+            "msvc",
+            Path("C:/VS/cl.exe"),
+            Path("C:/VS/cl.exe"),
+            version="19.44",
+        )
+        with patch(
+            "llvm_mgr.builder.discover_host_toolchains",
+            return_value=[msvc, sibling_clang_cl, host],
+        ):
+            selected = _windows_libxml2_toolchain(host)
+
+        self.assertIs(selected, sibling_clang_cl)
+
+    def test_windows_libxml2_reports_missing_msvc_compatible_compiler(self) -> None:
+        host = HostToolchain(
+            "gcc-15",
+            "GCC",
+            "gcc",
+            Path("C:/GCC/gcc.exe"),
+            Path("C:/GCC/g++.exe"),
+            version="15.1.0",
+        )
+        with (
+            patch("llvm_mgr.builder.discover_host_toolchains", return_value=[host]),
+            self.assertRaisesRegex(LLVMManagerError, "MSVC-compatible compiler"),
+        ):
+            _windows_libxml2_toolchain(host)
 
 
 class BuilderStandardLibraryTests(unittest.TestCase):

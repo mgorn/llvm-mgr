@@ -26,7 +26,7 @@ from .standard_library import (
     standard_library_runtimes,
     validate_standard_library,
 )
-from .toolchains import HostToolchain, toolchain_environment
+from .toolchains import HostToolchain, discover_host_toolchains, toolchain_environment
 from .util import LLVMManagerError, file_lock, read_json, require_tools, run, write_json
 
 _LLVM_MAJOR_RE = re.compile(r"\bset\s*\(\s*LLVM_VERSION_MAJOR\s+(\d+)\s*\)", re.IGNORECASE)
@@ -397,6 +397,41 @@ def _windows_libxml2_source(paths: ManagerPaths) -> Path:
     return source
 
 
+def _windows_libxml2_toolchain(host_toolchain: HostToolchain) -> HostToolchain:
+    if host_toolchain.family in {"msvc", "clang-cl"}:
+        return host_toolchain
+
+    compatible = [
+        toolchain
+        for toolchain in discover_host_toolchains()
+        if toolchain.family in {"msvc", "clang-cl"}
+    ]
+    if not compatible:
+        raise LLVMManagerError(
+            "Building llvm-mt on Windows requires an MSVC-compatible compiler "
+            "for the managed libxml2 dependency. Install Visual Studio C++ Build "
+            "Tools or clang-cl and try again."
+        )
+
+    try:
+        host_directory = host_toolchain.cc.parent.resolve()
+    except OSError:
+        host_directory = host_toolchain.cc.parent.absolute()
+
+    def preference(toolchain: HostToolchain) -> tuple[int, int, int]:
+        try:
+            candidate_directory = toolchain.cc.parent.resolve()
+        except OSError:
+            candidate_directory = toolchain.cc.parent.absolute()
+        return (
+            0 if candidate_directory == host_directory else 1,
+            0 if toolchain.version == host_toolchain.version else 1,
+            0 if toolchain.family == "clang-cl" else 1,
+        )
+
+    return min(compatible, key=preference)
+
+
 def _windows_libxml2_library(install_dir: Path) -> Path:
     candidates = (
         install_dir / "lib" / "libxml2s.lib",
@@ -427,16 +462,17 @@ def _build_windows_libxml2(
     options: BuildOptions,
     cmake: str,
     ninja: str,
-    env: dict[str, str],
 ) -> WindowsLibXml2 | None:
     if not _tool_selection_requires_libxml2(options, sys.platform):
         return None
 
     source = _windows_libxml2_source(paths)
+    dependency_toolchain = _windows_libxml2_toolchain(options.host_toolchain)
+    dependency_env = toolchain_environment(dependency_toolchain)
     build_dir = (
         paths.build_root
         / "_dependencies"
-        / f"libxml2-{_WINDOWS_LIBXML2_VERSION}-{options.host_toolchain.identifier}"
+        / f"libxml2-{_WINDOWS_LIBXML2_VERSION}-{dependency_toolchain.identifier}"
     )
     install_dir = build_dir / "install"
     include_dir = install_dir / "include" / "libxml2"
@@ -458,10 +494,10 @@ def _build_windows_libxml2(
             f"-DCMAKE_MAKE_PROGRAM={ninja}",
             "-DCMAKE_BUILD_TYPE=Release",
             f"-DCMAKE_INSTALL_PREFIX={install_dir}",
-            f"-DCMAKE_C_COMPILER={options.host_toolchain.cc}",
+            f"-DCMAKE_C_COMPILER={dependency_toolchain.cc}",
             *_WINDOWS_LIBXML2_CMAKE_OPTIONS,
         ],
-        env=env,
+        env=dependency_env,
     )
     run(
         [
@@ -473,7 +509,7 @@ def _build_windows_libxml2(
             "--parallel",
             str(options.jobs),
         ],
-        env=env,
+        env=dependency_env,
     )
     if not include_dir.is_dir():
         raise LLVMManagerError(f"Managed libxml2 build produced no headers under {include_dir}")
@@ -736,7 +772,6 @@ def build_and_install(paths: ManagerPaths, options: BuildOptions) -> Path:
             options,
             tools["cmake"],
             tools["ninja"],
-            build_env,
         )
 
         run(
