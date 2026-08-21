@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import sys
@@ -195,6 +196,46 @@ def _host_cmake_options(platform: str) -> tuple[str, ...]:
     return ()
 
 
+def _windows_assembly_cmake_options(
+    options: BuildOptions,
+    env: dict[str, str],
+) -> tuple[str, ...]:
+    if not sys.platform.startswith("win") or options.host_toolchain.family not in {"msvc", "clang-cl"}:
+        return ()
+
+    machine = platform.machine().lower()
+    if machine in {"x86_64", "amd64", "x64"}:
+        masm_name = "ml64.exe"
+    elif machine in {"x86", "i386", "i686"}:
+        masm_name = "ml.exe"
+    else:
+        return ()
+
+    candidates: list[Path] = []
+    if options.host_toolchain.family == "clang-cl":
+        candidates.append(options.host_toolchain.cc.parent / "llvm-ml.exe")
+
+    search_names = (
+        ("llvm-ml.exe", masm_name)
+        if options.host_toolchain.family == "clang-cl"
+        else (masm_name, "llvm-ml.exe")
+    )
+    search_path = env.get("PATH")
+    for name in search_names:
+        found = shutil.which(name, path=search_path)
+        if found:
+            candidates.append(Path(found))
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return (f"-DCMAKE_ASM_MASM_COMPILER={candidate}",)
+
+    # LLVM's x86 BLAKE3 support otherwise asks CMake for Microsoft's ml/ml64
+    # assembler. Keep clang-cl/MSVC builds self-contained when neither MASM nor
+    # llvm-ml is available by selecting LLVM's portable implementation instead.
+    return ("-DLLVM_DISABLE_ASSEMBLY_FILES=ON",)
+
+
 def _validate_options(options: BuildOptions) -> None:
     if options.jobs < 1:
         raise LLVMManagerError("Build job count must be at least 1")
@@ -232,8 +273,12 @@ def _llvm_major(llvm_source: Path) -> int:
     )
 
 
-def _configuration(options: BuildOptions, install_prefix: Path) -> dict[str, object]:
-    return {
+def _configuration(
+    options: BuildOptions,
+    install_prefix: Path,
+    windows_assembly_options: tuple[str, ...] = (),
+) -> dict[str, object]:
+    configuration: dict[str, object] = {
         "revision": {"kind": options.revision.kind.value, "value": options.revision.value},
         "install_prefix": str(install_prefix),
         "build_type": options.build_type,
@@ -246,6 +291,9 @@ def _configuration(options: BuildOptions, install_prefix: Path) -> dict[str, obj
         "host_cc": str(options.host_toolchain.cc),
         "host_cxx": str(options.host_toolchain.cxx),
     }
+    if windows_assembly_options:
+        configuration["windows_assembly_cmake_options"] = list(windows_assembly_options)
+    return configuration
 
 
 def _configuration_hash(configuration: dict[str, object]) -> str:
@@ -524,6 +572,7 @@ def _configure_command(
     install_prefix: Path,
     options: BuildOptions,
     windows_libxml2: WindowsLibXml2 | None = None,
+    windows_assembly_options: tuple[str, ...] = (),
 ) -> list[str | Path]:
     command: list[str | Path] = [
         cmake,
@@ -544,6 +593,7 @@ def _configure_command(
         "-DLLVM_INCLUDE_BENCHMARKS=OFF",
     ]
     command.extend(_host_cmake_options(sys.platform))
+    command.extend(windows_assembly_options)
     runtimes = _primary_build_runtimes(options, sys.platform)
     if runtimes:
         command.append(f"-DLLVM_ENABLE_RUNTIMES={_cmake_list(runtimes)}")
@@ -763,7 +813,8 @@ def build_and_install(paths: ManagerPaths, options: BuildOptions) -> Path:
             f"{options.revision.directory_name}-{options.build_type}-{options.host_toolchain.identifier}"
         )
         install_prefix = options.install_prefix.expanduser().resolve()
-        configuration = _configuration(options, install_prefix)
+        windows_assembly_options = _windows_assembly_cmake_options(options, build_env)
+        configuration = _configuration(options, install_prefix, windows_assembly_options)
         config_hash = _configuration_hash(configuration)
         _prepare_build_directory(build_dir, configuration, options.clean)
         _prepare_install_prefix(paths, install_prefix, config_hash, options.clean)
@@ -783,6 +834,7 @@ def build_and_install(paths: ManagerPaths, options: BuildOptions) -> Path:
                 install_prefix,
                 options,
                 windows_libxml2,
+                windows_assembly_options,
             ),
             env=build_env,
         )
