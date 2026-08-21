@@ -228,7 +228,12 @@ def _windows_assembly_cmake_options(
 
     for candidate in candidates:
         if candidate.is_file():
-            return (f"-DCMAKE_ASM_MASM_COMPILER={candidate}",)
+            cmake_options = [f"-DCMAKE_ASM_MASM_COMPILER={candidate}"]
+            if machine in {"x86_64", "amd64", "x64"} and candidate.name.lower() == "llvm-ml.exe":
+                # llvm-ml defaults to a 32-bit target unless told otherwise. LLVM's
+                # own WinMsvc.cmake toolchain likewise adds -m64 for x86_64 MASM.
+                cmake_options.append("-DCMAKE_ASM_MASM_FLAGS_INIT=-m64")
+            return tuple(cmake_options)
 
     # LLVM's x86 BLAKE3 support otherwise asks CMake for Microsoft's ml/ml64
     # assembler. Keep clang-cl/MSVC builds self-contained when neither MASM nor
