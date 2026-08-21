@@ -8,6 +8,7 @@ from unittest.mock import patch
 from llvm_mgr.builder import (
     BuildOptions,
     WindowsLibXml2,
+    _configuration,
     _configure_command,
     _distribution_components,
     _host_cmake_options,
@@ -17,6 +18,7 @@ from llvm_mgr.builder import (
     _primary_build_runtimes,
     _tool_selection_requires_libxml2,
     _verification_tools,
+    _windows_assembly_cmake_options,
     _windows_libxml2_toolchain,
     _llvm_major,
 )
@@ -193,13 +195,76 @@ class BuilderToolSelectionTests(unittest.TestCase):
                 Path("C:/install"),
                 options,
                 libxml2,
+                ("-DLLVM_DISABLE_ASSEMBLY_FILES=ON",),
             )
 
         self.assertTrue(_tool_selection_requires_libxml2(options, "win32"))
         self.assertIn("-DLLVM_ENABLE_LIBXML2=FORCE_ON", command)
         self.assertIn("-DLIBXML2_INCLUDE_DIR=C:/libxml/include/libxml2", command)
         self.assertIn("-DLIBXML2_LIBRARIES=C:/libxml/lib/libxml2s.lib", command)
+        self.assertIn("-DLLVM_DISABLE_ASSEMBLY_FILES=ON", command)
         self.assertEqual(_verification_tools(options, "win32"), ("llvm-mt", "mt"))
+
+    def test_windows_clang_cl_prefers_sibling_llvm_ml_for_masm(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            binary_dir = Path(temporary)
+            clang_cl = binary_dir / "clang-cl.exe"
+            llvm_ml = binary_dir / "llvm-ml.exe"
+            clang_cl.write_text("", encoding="utf-8")
+            llvm_ml.write_text("", encoding="utf-8")
+            host = HostToolchain(
+                "clang-cl-24",
+                "ClangCL",
+                "clang-cl",
+                clang_cl,
+                clang_cl,
+                version="24.0.0",
+            )
+            options = BuildOptions(
+                revision=SourceRevision(RevisionKind.BRANCH, "main"),
+                install_prefix=Path("C:/install"),
+                host_toolchain=host,
+            )
+
+            with (
+                patch("llvm_mgr.builder.sys.platform", "win32"),
+                patch("llvm_mgr.builder.platform.machine", return_value="AMD64"),
+            ):
+                cmake_options = _windows_assembly_cmake_options(options, {"PATH": ""})
+
+        self.assertEqual(cmake_options, (f"-DCMAKE_ASM_MASM_COMPILER={llvm_ml}",))
+
+    def test_windows_clang_cl_disables_optional_assembly_without_masm(self) -> None:
+        host = HostToolchain(
+            "clang-cl-24",
+            "ClangCL",
+            "clang-cl",
+            Path("C:/LLVM/clang-cl.exe"),
+            Path("C:/LLVM/clang-cl.exe"),
+            version="24.0.0",
+        )
+        options = BuildOptions(
+            revision=SourceRevision(RevisionKind.BRANCH, "main"),
+            install_prefix=Path("C:/install"),
+            host_toolchain=host,
+        )
+
+        with (
+            patch("llvm_mgr.builder.sys.platform", "win32"),
+            patch("llvm_mgr.builder.platform.machine", return_value="AMD64"),
+            patch("llvm_mgr.builder.shutil.which", return_value=None),
+        ):
+            cmake_options = _windows_assembly_cmake_options(options, {"PATH": ""})
+
+        self.assertEqual(cmake_options, ("-DLLVM_DISABLE_ASSEMBLY_FILES=ON",))
+
+    def test_windows_assembly_choice_is_part_of_build_configuration(self) -> None:
+        options = self._options()
+        cmake_options = ("-DLLVM_DISABLE_ASSEMBLY_FILES=ON",)
+
+        configuration = _configuration(options, Path("C:/install"), cmake_options)
+
+        self.assertEqual(configuration["windows_assembly_cmake_options"], list(cmake_options))
 
     def test_windows_subset_without_llvm_mt_does_not_require_libxml2(self) -> None:
         options = self._options(("llvm-objdump",))
