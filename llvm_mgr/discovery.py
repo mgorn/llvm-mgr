@@ -130,13 +130,11 @@ def inspect_install(
     clang = _candidate_clang(resolved)
     if clang is None:
         return None
-    probed_version = _clang_version(clang)
-    if probed_version is None:
-        return None
 
     metadata = _metadata(resolved)
     tag = _metadata_tag(metadata)
     tag_version = parse_llvm_tag(tag) if tag else None
+    probed_version = _clang_version(clang)
     manager_owned = (resolved / ".llvm-manager.json").is_file() if managed is None else managed
     version = tag_version or probed_version
     standard_library, standard_library_version = _metadata_standard_library(metadata, version)
