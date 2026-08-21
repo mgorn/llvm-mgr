@@ -224,6 +224,15 @@ def _select_cxx_standard_library() -> str:
         print("Choose 1 or 2.")
 
 
+def _select_llvm_tools() -> tuple[str, ...]:
+    print("LLVM tools:")
+    print("  Enter 'all' to build and install every configured LLVM tool (default).")
+    print("  Or enter a comma-separated subset, for example: lld,llvm-ar,llvm-objdump,llvm-mt")
+    print("  clang is always included so the result remains a usable managed compiler toolchain.")
+    selection = _prompt("LLVM tools to build [all]: ", default="all")
+    return _csv_tuple(selection)
+
+
 def _interactive_build(paths: ManagerPaths, repository_url: str) -> Path:
     revision = _select_revision(repository_url)
     host_toolchain = _choose_host_toolchain(None, prompt_install=True)
@@ -233,6 +242,7 @@ def _interactive_build(paths: ManagerPaths, repository_url: str) -> Path:
     cxx_standard_library = (
         _select_cxx_standard_library() if sys.platform == "darwin" else SYSTEM_CXX_STANDARD_LIBRARY
     )
+    tools = _select_llvm_tools()
     targets = _prompt("LLVM targets to build [all; enter 'Native' for host-only]: ", default="all")
     jobs = int(_prompt(f"Parallel build jobs [{max(1, os.cpu_count() or 1)}]: ", default=str(max(1, os.cpu_count() or 1))))
     return build_and_install(
@@ -241,6 +251,7 @@ def _interactive_build(paths: ManagerPaths, repository_url: str) -> Path:
             revision=revision,
             install_prefix=install_prefix,
             host_toolchain=host_toolchain,
+            tools=tools,
             targets=targets,
             jobs=jobs,
             repository_url=repository_url,
@@ -386,6 +397,11 @@ def build_parser(default_root: Path | None = None) -> argparse.ArgumentParser:
     build.add_argument("--projects", default="clang,clang-tools-extra,lld", help="Comma-separated LLVM projects")
     build.add_argument("--runtimes", default="compiler-rt", help="Comma-separated LLVM runtimes; empty disables")
     build.add_argument(
+        "--tools",
+        default="all",
+        help="LLVM tools to install: 'all' (default) or a comma-separated subset; clang is always included",
+    )
+    build.add_argument(
         "--stdlib",
         "--cxx-stdlib",
         dest="cxx_standard_library",
@@ -502,6 +518,7 @@ def _handle_build(arguments: argparse.Namespace, paths: ManagerPaths) -> int:
             build_type=arguments.build_type,
             projects=_csv_tuple(arguments.projects),
             runtimes=_csv_tuple(arguments.runtimes),
+            tools=_csv_tuple(arguments.tools),
             targets=arguments.targets,
             jobs=arguments.jobs,
             repository_url=arguments.repo_url,
