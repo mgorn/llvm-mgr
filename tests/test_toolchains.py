@@ -50,6 +50,22 @@ class ToolchainDiscoveryTests(unittest.TestCase):
             self.assertEqual(apple.cxx.name, "clang++")
             self.assertEqual(gnu.cxx.name, "g++-13")
 
+    def test_default_discovery_uses_augmented_windows_search_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            binary_dir = Path(temporary)
+            clang = self._compiler(binary_dir, "clang", "clang version 18.1.8")
+            (binary_dir / "clang++").symlink_to(clang.name)
+
+            with mock.patch(
+                "llvm_mgr.toolchains.augment_windows_search_path",
+                return_value=str(binary_dir),
+            ) as augment:
+                toolchains = discover_host_toolchains()
+
+            augment.assert_called_once_with(None)
+            self.assertEqual(len(toolchains), 1)
+            self.assertEqual(toolchains[0].family, "clang")
+
     def test_selects_by_number_id_family_and_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             binary_dir = Path(temporary)

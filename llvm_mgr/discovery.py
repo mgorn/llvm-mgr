@@ -8,6 +8,7 @@ from .config import ManagerPaths
 from .models import InstallInfo
 from .util import probe_text, read_json, shutil_which
 from .versioning import LLVMVersion, parse_llvm_tag, parse_version_text
+from .windows import augment_windows_search_path, windows_llvm_prefixes
 
 _CLANG_NAMES = ("clang", "clang.exe")
 _VERSIONED_CLANG_RE = re.compile(r"^clang-(\d+)(?:\.exe)?$", re.IGNORECASE)
@@ -129,13 +130,11 @@ def inspect_install(
     clang = _candidate_clang(resolved)
     if clang is None:
         return None
-    probed_version = _clang_version(clang)
-    if probed_version is None:
-        return None
 
     metadata = _metadata(resolved)
     tag = _metadata_tag(metadata)
     tag_version = parse_llvm_tag(tag) if tag else None
+    probed_version = _clang_version(clang)
     manager_owned = (resolved / ".llvm-manager.json").is_file() if managed is None else managed
     version = tag_version or probed_version
     standard_library, standard_library_version = _metadata_standard_library(metadata, version)
@@ -159,10 +158,7 @@ def _common_prefixes(search_path: str | None = None) -> list[Path]:
         prefixes.append(Path(clang_on_path).resolve().parent.parent)
 
     if os.name == "nt":
-        for variable in ("ProgramFiles", "ProgramFiles(x86)"):
-            base = os.environ.get(variable)
-            if base:
-                prefixes.append(Path(base) / "LLVM")
+        prefixes.extend(windows_llvm_prefixes())
     else:
         prefixes.extend((Path("/usr"), Path("/usr/local")))
         glob_roots = (
@@ -210,7 +206,7 @@ def scan_installs(
         except OSError:
             pass
 
-    path_value = search_path if search_path is not None else os.environ.get("PATH", "")
+    path_value = augment_windows_search_path(search_path)
     if include_external:
         candidates.extend((prefix, False) for prefix in _common_prefixes(path_value))
         for path_entry in path_value.split(os.pathsep):
