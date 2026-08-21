@@ -225,6 +225,7 @@ def main() -> int:
         assert len(metadata["source"]["commit"]) == 40
         assert metadata["host_toolchain"]["family"] == "clang"
         assert metadata["host_toolchain"]["cc"] == str(host_compiler)
+        assert metadata["tools"] == ["all"]
         assert metadata["targets"] == "all"
         standard_library = metadata["cxx_standard_library"]
         assert standard_library["kind"] == "managed-libc++"
@@ -245,6 +246,7 @@ def main() -> int:
         assert f"-DCMAKE_C_COMPILER={host_compiler}" in configure_args
         assert f"-DCMAKE_CXX_COMPILER={fake_bin / 'clang++'}" in configure_args
         assert "-DLLVM_TARGETS_TO_BUILD=all" in configure_args
+        assert "-DLLVM_DISTRIBUTION_COMPONENTS=" not in configure_args
         assert "-DLLVM_ENABLE_RUNTIMES=compiler-rt;libcxx;libcxxabi;libunwind" in configure_args
         assert "-DLIBCXXABI_USE_LLVM_UNWINDER=ON" in configure_args
         assert (manager_root / "current").resolve() == install.resolve()
