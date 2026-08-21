@@ -232,7 +232,44 @@ class BuilderToolSelectionTests(unittest.TestCase):
             ):
                 cmake_options = _windows_assembly_cmake_options(options, {"PATH": ""})
 
-        self.assertEqual(cmake_options, (f"-DCMAKE_ASM_MASM_COMPILER={llvm_ml}",))
+        self.assertEqual(
+            cmake_options,
+            (
+                f"-DCMAKE_ASM_MASM_COMPILER={llvm_ml}",
+                "-DCMAKE_ASM_MASM_FLAGS_INIT=-m64",
+            ),
+        )
+
+    def test_windows_msvc_ml64_does_not_get_llvm_ml_architecture_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            binary_dir = Path(temporary)
+            compiler = binary_dir / "cl.exe"
+            ml64 = binary_dir / "ml64.exe"
+            compiler.write_text("", encoding="utf-8")
+            ml64.write_text("", encoding="utf-8")
+            ml64.chmod(0o755)
+            host = HostToolchain(
+                "msvc-19",
+                "MSVC",
+                "msvc",
+                compiler,
+                compiler,
+                version="19.44",
+            )
+            options = BuildOptions(
+                revision=SourceRevision(RevisionKind.BRANCH, "main"),
+                install_prefix=Path("C:/install"),
+                host_toolchain=host,
+            )
+
+            with (
+                patch("llvm_mgr.builder.sys.platform", "win32"),
+                patch("llvm_mgr.builder.platform.machine", return_value="AMD64"),
+                patch("llvm_mgr.builder.shutil.which", return_value=str(ml64)),
+            ):
+                cmake_options = _windows_assembly_cmake_options(options, {"PATH": str(binary_dir)})
+
+        self.assertEqual(cmake_options, (f"-DCMAKE_ASM_MASM_COMPILER={ml64}",))
 
     def test_windows_clang_cl_disables_optional_assembly_without_masm(self) -> None:
         host = HostToolchain(
